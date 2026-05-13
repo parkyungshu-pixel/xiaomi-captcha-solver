@@ -1,19 +1,24 @@
 """
-Xiaomi registration flow automation using Playwright with stealth mode.
+Xiaomi registration flow — Playwright + YOLOv8 multi-round reCAPTCHA solver.
 
-Flow:
-  1. Open Xiaomi login page in mobile viewport (1080x1920, Android Chrome UA).
-  2. Click the "Sign up" tab.
-  3. Fill Email, New password, Confirm new password.
-  4. Tick the "I've read and agreed..." checkbox — required to enable Next.
-  5. Click the orange "Next" button.
-  6. Wait 10 s for the captcha to fully render.
-  7. Auto-detect the captcha iframe, crop it from the screenshot, run YOLOv8.
-  8. Click the detected object centers via page.mouse.click().
+Full pipeline:
+  1. Mobile viewport (1080×1920, Android Chrome UA) to match Android Desktop-Site.
+  2. Registration form:
+       a. Click "Sign up" tab
+       b. Fill Email / New password / Confirm password
+       c. Tick "I've read and agreed to the Xiaomi Account User Agreement" checkbox
+       d. Click orange "Next" button
+  3. Multi-round reCAPTCHA solver loop (max 10 rounds):
+       • If the anchor checkbox is visible and not yet checked → click it first
+       • Detect targets with YOLOv8, click each with a ±5 px human-like jitter
+       • If bottom button is "Next"   → click it, iterate to the next round
+       • If bottom button is "Verify" → click it, wait for iframe to disappear → done
+       • On round 10 timeout          → log CAPTCHA_FAILED, reload page
 """
 
 import asyncio
 import logging
+import random
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -22,91 +27,108 @@ from typing import List, Optional, Tuple
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright_stealth import Stealth
 
-# ---------------------------------------------------------------------------
-# URLs
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
 XIAOMI_LOGIN_URL = "https://account.xiaomi.com/pass/serviceLogin?sid=passport"
 
-# ---------------------------------------------------------------------------
-# Browser / viewport config
-# Mobile viewport to match the Android Desktop-Site view in the screenshot.
-# page.mouse.click() coords must match the viewport, NOT the screenshot pixels
-# when full_page=True captures content beyond the fold.
-# ---------------------------------------------------------------------------
+# Mobile UA — must match the Android Desktop-Site layout we see in screenshots.
 USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/125.0.0.0 Mobile Safari/537.36"
 )
-VIEWPORT = {"width": 1080, "height": 1920}
-LOCALE = "en-US"
-TIMEZONE_ID = "Asia/Manila"
+VIEWPORT       = {"width": 1080, "height": 1920}
+LOCALE         = "en-US"
+TIMEZONE_ID    = "Asia/Manila"
 
-# ---------------------------------------------------------------------------
-# Screenshot / debug paths
-# ---------------------------------------------------------------------------
-SCREENSHOT_PATH   = "check.png"        # full-page after captcha triggered
-DEBUG_FORM_PATH   = "debug_form.png"   # after fields are filled, before Next
-
-# ---------------------------------------------------------------------------
-# Captcha / YOLO config
-# ---------------------------------------------------------------------------
-# Fallback crop used when the bframe bounding-box lookup fails.
-# (left, top, right, bottom) in screenshot coordinates.
-CAPTCHA_CROP_BOX: Tuple[int, int, int, int] = (0, 0, 1080, 1920)
-
+# Debug / output files
+SCREENSHOT_PATH  = "check.png"        # refreshed before every YOLO round
+DEBUG_FORM_PATH  = "debug_form.png"   # taken after filling the form
 CAPTCHA_CROP_PATH = "captcha_crop.png"
-YOLO_MODEL_PATH   = "yolov8n.pt"
 
+# YOLOv8
+YOLO_MODEL_PATH           = "yolov8n.pt"
+YOLO_CONFIDENCE_THRESHOLD = 0.20
 TARGET_CLASSES = {
     "bus", "traffic light", "car", "truck",
     "bicycle", "motorcycle", "fire hydrant", "stop sign",
 }
 
-YOLO_CONFIDENCE_THRESHOLD = 0.20
-CLICK_DELAY_SECONDS       = 0.4
+# Solver loop
+MAX_CAPTCHA_ROUNDS  = 10    # give up after this many rounds
+CLICK_DELAY_S       = 0.4   # pause between object clicks (seconds)
+HUMAN_JITTER_PX     = 5     # ±px random offset on every click
+ROUND_WAIT_MS       = 3000  # ms to wait for the grid to load each round
 
-# ---------------------------------------------------------------------------
+# Fallback full-page crop when bframe bounding box cannot be found
+CAPTCHA_CROP_FALLBACK: Tuple[int, int, int, int] = (0, 0, 1080, 1920)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Logging
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("xiaomi-captcha")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Geometry helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
+def _clamp_box(
+    box: Tuple[int, int, int, int],
+    max_w: int = 16384,
+    max_h: int = 16384,
+) -> Tuple[int, int, int, int]:
+    """Ensure all coordinates are non-negative and box has positive area."""
+    l = max(0, box[0])
+    t = max(0, box[1])
+    r = max(l + 1, min(box[2], max_w))
+    b = max(t + 1, min(box[3], max_h))
+    return (l, t, r, b)
+
+
+def _jitter(coord: float, px: int = HUMAN_JITTER_PX) -> float:
+    """Add a small random offset to a click coordinate."""
+    return coord + random.uniform(-px, px)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # YOLO helpers
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+
 @lru_cache(maxsize=1)
-def _load_yolo_model():
+def _load_yolo():
     from ultralytics import YOLO
     logger.info("Loading YOLO model: %s", YOLO_MODEL_PATH)
     return YOLO(YOLO_MODEL_PATH)
 
 
-def _crop_captcha(
-    screenshot_path: str,
-    crop_box: Tuple[int, int, int, int],
-    out_path: str,
+def _crop_screenshot(
+    src: str,
+    box: Tuple[int, int, int, int],
+    dst: str,
 ) -> str:
     from PIL import Image
-    if not Path(screenshot_path).exists():
-        raise FileNotFoundError(f"Screenshot not found: {screenshot_path}")
-    with Image.open(screenshot_path) as img:
-        img.crop(crop_box).save(out_path)
-    logger.info("Saved captcha crop %s → %s", crop_box, out_path)
-    return out_path
+    if not Path(src).exists():
+        raise FileNotFoundError(f"Screenshot not found: {src}")
+    with Image.open(src) as img:
+        img.crop(box).save(dst)
+    logger.info("Saved crop %s → %s", box, dst)
+    return dst
 
 
-def _detect_targets(
+def _run_yolo(
     crop_path: str,
-    crop_origin: Tuple[int, int],
+    origin: Tuple[int, int],
 ) -> List[Tuple[str, float, float, float]]:
-    model   = _load_yolo_model()
+    """Return list of (label, conf, viewport_cx, viewport_cy) sorted by conf desc."""
+    model   = _load_yolo()
     results = model.predict(source=crop_path, conf=YOLO_CONFIDENCE_THRESHOLD, verbose=False)
-    ox, oy  = crop_origin
+    ox, oy  = origin
     hits: List[Tuple[str, float, float, float]] = []
     for result in results:
         if result.boxes is None:
@@ -116,33 +138,38 @@ def _detect_targets(
             if label not in TARGET_CLASSES:
                 continue
             x1, y1, x2, y2 = box.xyxy[0].tolist()
-            hits.append((label, float(box.conf[0]),
-                          (x1 + x2) / 2 + ox,
-                          (y1 + y2) / 2 + oy))
+            hits.append((
+                label,
+                float(box.conf[0]),
+                (x1 + x2) / 2.0 + ox,
+                (y1 + y2) / 2.0 + oy,
+            ))
     hits.sort(key=lambda d: d[1], reverse=True)
     return hits
 
+# ─────────────────────────────────────────────────────────────────────────────
+# reCAPTCHA iframe helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# reCAPTCHA helpers
-# ---------------------------------------------------------------------------
+# Anchor iframe = the small "I'm not a robot" widget
+ANCHOR_SELS = (
+    'iframe[title="reCAPTCHA"]',
+    'iframe[src*="recaptcha/api2/anchor"]',
+    'iframe[src*="recaptcha/enterprise/anchor"]',
+)
 
-def _clamp_box(box: Tuple[int, int, int, int],
-               max_w: int = 16384,
-               max_h: int = 16384) -> Tuple[int, int, int, int]:
-    """Clamp a (left, top, right, bottom) crop box so every coordinate is
-    non-negative and right > left, bottom > top.  Negative viewport positions
-    can occur when the iframe is partially off-screen."""
-    left   = max(0, box[0])
-    top    = max(0, box[1])
-    right  = max(left + 1, min(box[2], max_w))
-    bottom = max(top  + 1, min(box[3], max_h))
-    return (left, top, right, bottom)
+# bframe = the image-selection challenge popup
+BFRAME_SELS = (
+    'iframe[src*="recaptcha/api2/bframe"]',
+    'iframe[src*="recaptcha/enterprise/bframe"]',
+    'iframe[title*="recaptcha challenge"]',
+)
 
 
-async def _get_bounding_box(page: Page,
-                            selectors: Tuple[str, ...]) -> Optional[Tuple[int, int, int, int]]:
-    """Try each selector in turn; return the first valid bounding box found."""
+async def _bounding_box(
+    page: Page,
+    selectors: Tuple[str, ...],
+) -> Optional[Tuple[int, int, int, int]]:
     for sel in selectors:
         try:
             loc = page.locator(sel)
@@ -153,149 +180,222 @@ async def _get_bounding_box(page: Page,
             continue
         if not raw:
             continue
-        left  = int(raw["x"])
-        top   = int(raw["y"])
-        right  = left + int(raw["width"])
-        bottom = top  + int(raw["height"])
-        logger.info("Bounding box via %s → (%d,%d,%d,%d)", sel, left, top, right, bottom)
-        return (left, top, right, bottom)
+        l = int(raw["x"])
+        t = int(raw["y"])
+        r = l + int(raw["width"])
+        b = t + int(raw["height"])
+        logger.info("bbox via %s → (%d,%d,%d,%d)", sel, l, t, r, b)
+        return (l, t, r, b)
     return None
 
 
-# Selectors for the reCAPTCHA ANCHOR iframe (the "I'm not a robot" checkbox).
-RECAPTCHA_ANCHOR_SELECTORS = (
-    'iframe[title="reCAPTCHA"]',
-    'iframe[src*="recaptcha/api2/anchor"]',
-    'iframe[src*="recaptcha/enterprise/anchor"]',
-)
-
-# Selectors for the reCAPTCHA CHALLENGE iframe (the image grid popup).
-RECAPTCHA_BFRAME_SELECTORS = (
-    'iframe[src*="recaptcha/api2/bframe"]',
-    'iframe[src*="recaptcha/enterprise/bframe"]',
-    'iframe[title*="recaptcha challenge"]',
-)
-
-
-async def _click_recaptcha_anchor(page: Page) -> bool:
-    """Find the reCAPTCHA anchor iframe, switch into it, and click the
-    checkbox.  This is what triggers the image-selection challenge to appear.
-
-    Returns True if the checkbox was successfully clicked.
-    """
-    for sel in RECAPTCHA_ANCHOR_SELECTORS:
+async def _anchor_is_visible(page: Page) -> bool:
+    for sel in ANCHOR_SELS:
         try:
             loc = page.locator(sel)
-            if await loc.count() == 0:
-                continue
-
-            # frame_locator lets us query elements inside a cross-origin iframe
-            frame = page.frame_locator(sel)
-            checkbox = frame.locator("#recaptcha-anchor")
-            if await checkbox.count() == 0:
-                # fallback: try any role=checkbox inside the iframe
-                checkbox = frame.locator("[role='checkbox']")
-            if await checkbox.count() == 0:
-                logger.warning("No checkbox found inside anchor iframe (%s)", sel)
-                continue
-
-            await checkbox.click(timeout=5000)
-            logger.info("✓ reCAPTCHA anchor checkbox clicked via iframe: %s", sel)
-            return True
-        except Exception as exc:
-            logger.warning("Could not click anchor via %s: %s", sel, exc)
-            continue
-
-    logger.warning("✗ reCAPTCHA anchor iframe not found — captcha may not pop up")
+            if await loc.count() > 0 and await loc.first.is_visible():
+                return True
+        except Exception:
+            pass
     return False
 
 
-async def _locate_challenge_box(page: Page) -> Optional[Tuple[int, int, int, int]]:
-    """Return the bounding box of the reCAPTCHA challenge (bframe) iframe,
-    clamped to non-negative coordinates."""
-    raw = await _get_bounding_box(page, RECAPTCHA_BFRAME_SELECTORS)
-    if raw is None:
-        return None
-    clamped = _clamp_box(raw)
-    if clamped != raw:
-        logger.info("Clamped challenge box %s → %s", raw, clamped)
-    return clamped
+async def _bframe_is_visible(page: Page) -> bool:
+    for sel in BFRAME_SELS:
+        try:
+            loc = page.locator(sel)
+            if await loc.count() > 0 and await loc.first.is_visible():
+                return True
+        except Exception:
+            pass
+    return False
 
 
-# ---------------------------------------------------------------------------
-# YOLO captcha solver
-# ---------------------------------------------------------------------------
-async def solve_captcha(page: Page) -> bool:
-    """Full two-phase reCAPTCHA solve:
+async def _click_anchor_checkbox(page: Page) -> bool:
+    """Enter the anchor iframe and click #recaptcha-anchor to open the challenge."""
+    for sel in ANCHOR_SELS:
+        try:
+            if await page.locator(sel).count() == 0:
+                continue
+            frame    = page.frame_locator(sel)
+            checkbox = frame.locator("#recaptcha-anchor")
+            if await checkbox.count() == 0:
+                checkbox = frame.locator("[role='checkbox']")
+            if await checkbox.count() == 0:
+                continue
+            await checkbox.click(timeout=5000)
+            logger.info("✓ Anchor checkbox clicked via: %s", sel)
+            return True
+        except Exception as exc:
+            logger.warning("Anchor click failed (%s): %s", sel, exc)
+    logger.warning("✗ Anchor checkbox not found")
+    return False
 
-    Phase 1 — Trigger the image challenge:
-        a. Find the reCAPTCHA anchor iframe and click its checkbox.
-        b. Wait 3 s for the image-selection grid to fully render.
+# ─────────────────────────────────────────────────────────────────────────────
+# bframe button helpers (Next / Verify inside the challenge popup)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    Phase 2 — Detect and click targets:
-        a. Take a fresh full-page screenshot AFTER the grid is visible.
-        b. Get the bframe bounding box and crop captcha_crop.png from it.
-        c. Run YOLOv8 on the crop to detect TARGET_CLASSES objects.
-        d. Click each detection center via page.mouse.click().
+async def _get_bframe_button_text(page: Page) -> str:
+    """Return the lowercase text of the primary action button inside the bframe."""
+    for sel in BFRAME_SELS:
+        try:
+            if await page.locator(sel).count() == 0:
+                continue
+            frame = page.frame_locator(sel)
+            # reCAPTCHA uses #recaptcha-verify-button for Verify
+            # and   #recaptcha-reload-button is "Get new challenge" (skip)
+            for btn_sel in ("#recaptcha-verify-button", ".rc-button-default", "button"):
+                btn = frame.locator(btn_sel)
+                if await btn.count() == 0:
+                    continue
+                txt = (await btn.first.inner_text()).strip().lower()
+                if txt:
+                    return txt
+        except Exception:
+            pass
+    return ""
+
+
+async def _click_bframe_button(page: Page, label: str) -> bool:
+    """Click a button by its text inside the bframe challenge popup."""
+    label_lower = label.lower()
+    for sel in BFRAME_SELS:
+        try:
+            if await page.locator(sel).count() == 0:
+                continue
+            frame = page.frame_locator(sel)
+            for btn_sel in ("#recaptcha-verify-button", ".rc-button-default", "button"):
+                btn = frame.locator(btn_sel)
+                cnt = await btn.count()
+                for i in range(cnt):
+                    b   = btn.nth(i)
+                    txt = (await b.inner_text()).strip().lower()
+                    if label_lower in txt:
+                        await b.click(timeout=5000)
+                        logger.info("✓ bframe '%s' button clicked", label)
+                        return True
+        except Exception as exc:
+            logger.warning("bframe button click failed (%s): %s", label, exc)
+    logger.warning("✗ bframe '%s' button not found", label)
+    return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-round reCAPTCHA solver
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def solve_captcha_loop(page: Page) -> bool:
     """
-    # ── Phase 1: click the checkbox to open the challenge ───────────────────
-    logger.info("Phase 1: clicking reCAPTCHA anchor checkbox…")
-    await _click_recaptcha_anchor(page)
+    Multi-round solver loop (up to MAX_CAPTCHA_ROUNDS).
 
-    # Wait for the image challenge popup (bframe) to fully load.
-    logger.info("Waiting 3 s for image challenge to render…")
-    await page.wait_for_timeout(3000)
+    Each round:
+      1. If the anchor checkbox is visible (challenge not open) → click it.
+      2. Wait ROUND_WAIT_MS for image tiles to load.
+      3. Take a fresh screenshot, crop to the bframe bounding box.
+      4. Run YOLOv8 — click each detection with ±HUMAN_JITTER_PX offset.
+      5. Read the primary bframe button label:
+           "next"   → click it, continue to next round (new image set)
+           "verify" → click it, wait for iframe to disappear → SUCCESS
+      6. If no detections AND button is "verify" → click anyway (all tiles chosen).
 
-    # ── Phase 2a: fresh screenshot now that the grid is visible ─────────────
-    await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
-    logger.info("Saved post-challenge screenshot → %s", SCREENSHOT_PATH)
+    Returns True on success, False on timeout / repeated failure.
+    """
+    for rnd in range(1, MAX_CAPTCHA_ROUNDS + 1):
+        logger.info("── Captcha round %d / %d ──", rnd, MAX_CAPTCHA_ROUNDS)
 
-    # ── Phase 2b: locate bframe and crop ────────────────────────────────────
-    crop_box = await _locate_challenge_box(page)
-    if crop_box is None:
-        logger.warning("bframe not found — falling back to full-page crop %s",
-                       CAPTCHA_CROP_BOX)
-        crop_box = _clamp_box(CAPTCHA_CROP_BOX)
+        # Step 1 ── trigger the challenge if anchor is still showing ─────────
+        if await _anchor_is_visible(page) and not await _bframe_is_visible(page):
+            logger.info("Anchor visible — clicking 'I'm not a robot'…")
+            await _click_anchor_checkbox(page)
+            await page.wait_for_timeout(ROUND_WAIT_MS)
 
-    logger.info("Using crop box: %s", crop_box)
+        # Make sure bframe is actually there now
+        if not await _bframe_is_visible(page):
+            logger.warning("bframe still not visible after round %d anchor click", rnd)
+            await page.wait_for_timeout(2000)
+            if not await _bframe_is_visible(page):
+                logger.warning("Giving up waiting for bframe")
+                break
 
-    try:
-        crop_path = _crop_captcha(SCREENSHOT_PATH, crop_box, CAPTCHA_CROP_PATH)
-    except FileNotFoundError as exc:
-        logger.error(exc)
-        return False
+        # Step 2 ── wait for tiles to fully load ─────────────────────────────
+        await page.wait_for_timeout(ROUND_WAIT_MS)
 
-    # ── Phase 2c: YOLO inference ─────────────────────────────────────────────
-    loop       = asyncio.get_running_loop()
-    detections = await loop.run_in_executor(
-        None, _detect_targets, crop_path, (crop_box[0], crop_box[1])
-    )
+        # Step 3 ── screenshot + crop ─────────────────────────────────────────
+        await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
+        logger.info("[round %d] Screenshot saved → %s", rnd, SCREENSHOT_PATH)
 
-    if not detections:
-        logger.warning("No targets detected (classes=%s, conf≥%.2f)",
-                       sorted(TARGET_CLASSES), YOLO_CONFIDENCE_THRESHOLD)
-        return False
+        raw_box  = await _bounding_box(page, BFRAME_SELS)
+        crop_box = _clamp_box(raw_box) if raw_box else _clamp_box(CAPTCHA_CROP_FALLBACK)
+        logger.info("[round %d] Crop box: %s", rnd, crop_box)
 
-    logger.info("YOLO found %d target(s):", len(detections))
-    for label, conf, cx, cy in detections:
-        logger.info("  %-15s conf=%.2f  viewport=(%.1f, %.1f)", label, conf, cx, cy)
+        try:
+            _crop_screenshot(SCREENSHOT_PATH, crop_box, CAPTCHA_CROP_PATH)
+        except FileNotFoundError as exc:
+            logger.error(exc)
+            break
 
-    # ── Phase 2d: click each detected object ─────────────────────────────────
-    for label, _, cx, cy in detections:
-        # Extra safety: clamp click coords to viewport bounds
-        cx = max(0.0, min(cx, float(VIEWPORT["width"]  - 1)))
-        cy = max(0.0, min(cy, float(VIEWPORT["height"] - 1)))
-        logger.info("Clicking '%s' at (%.1f, %.1f)", label, cx, cy)
-        await page.mouse.click(cx, cy)
-        await asyncio.sleep(CLICK_DELAY_SECONDS)
+        # Step 4 ── YOLO detection + human-like clicks ────────────────────────
+        loop       = asyncio.get_running_loop()
+        detections = await loop.run_in_executor(
+            None, _run_yolo, CAPTCHA_CROP_PATH, (crop_box[0], crop_box[1])
+        )
 
-    # TODO: click the captcha's Verify/Submit button and confirm success.
-    return True
+        logger.info("[round %d] YOLO found %d target(s)", rnd, len(detections))
+        for label, conf, cx, cy in detections:
+            logger.info("  %-15s conf=%.2f  vp=(%.1f, %.1f)", label, conf, cx, cy)
 
+        for label, _, cx, cy in detections:
+            # Apply human-like jitter and clamp to viewport
+            jx = max(0.0, min(_jitter(cx), float(VIEWPORT["width"]  - 1)))
+            jy = max(0.0, min(_jitter(cy), float(VIEWPORT["height"] - 1)))
+            logger.info("  Click '%s' at (%.1f, %.1f) [jittered from (%.1f, %.1f)]",
+                        label, jx, jy, cx, cy)
+            await page.mouse.click(jx, jy)
+            await asyncio.sleep(CLICK_DELAY_S)
 
-# ---------------------------------------------------------------------------
-# Browser context factory
-# ---------------------------------------------------------------------------
+        # Short pause before checking the button
+        await page.wait_for_timeout(800)
+
+        # Step 5 ── read bframe button and act ────────────────────────────────
+        btn_text = await _get_bframe_button_text(page)
+        logger.info("[round %d] bframe button text: %r", rnd, btn_text)
+
+        if "next" in btn_text:
+            logger.info("[round %d] → Clicking 'Next' (new image set incoming)", rnd)
+            await _click_bframe_button(page, "next")
+            await page.wait_for_timeout(2000)
+            continue  # next round
+
+        elif "verify" in btn_text or btn_text == "":
+            # Either "verify" is showing, or we couldn't read it — try verify
+            logger.info("[round %d] → Clicking 'Verify'", rnd)
+            await _click_bframe_button(page, "verify")
+            await page.wait_for_timeout(3000)
+
+            # Check whether the challenge disappeared (success) ───────────────
+            if not await _bframe_is_visible(page):
+                logger.info("✓ CAPTCHA SOLVED on round %d", rnd)
+                return True
+
+            # Challenge still showing — may have been wrong, continue
+            logger.warning("[round %d] bframe still visible after Verify — retrying", rnd)
+            await page.wait_for_timeout(2000)
+            continue
+
+        else:
+            # Unknown button — just wait and retry
+            logger.warning("[round %d] Unknown button %r — waiting 2 s", rnd, btn_text)
+            await page.wait_for_timeout(2000)
+            continue
+
+    # ── Timeout: max rounds reached ───────────────────────────────────────────
+    logger.error("CAPTCHA_FAILED — max rounds (%d) reached, reloading page", MAX_CAPTCHA_ROUNDS)
+    await page.reload(wait_until="networkidle")
+    return False
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Browser context
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def launch_stealth_context(playwright, headless: bool = True):
     browser = await playwright.chromium.launch(
         headless=headless,
@@ -310,19 +410,17 @@ async def launch_stealth_context(playwright, headless: bool = True):
         viewport=VIEWPORT,
         locale=LOCALE,
         timezone_id=TIMEZONE_ID,
-        # Tell sites this is a mobile device so they serve the mobile layout.
         is_mobile=True,
         has_touch=True,
     )
     await Stealth().apply_stealth_async(context)
     return browser, context
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Generic click / fill helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Registration form flow
-# ---------------------------------------------------------------------------
 async def _try_click(page: Page, selectors: list, label: str) -> bool:
-    """Attempt selectors in order; return True on first successful click."""
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -340,7 +438,6 @@ async def _try_click(page: Page, selectors: list, label: str) -> bool:
 
 
 async def _try_fill(page: Page, selectors: list, value: str, label: str) -> bool:
-    """Attempt selectors in order; return True on first successful fill."""
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -354,184 +451,105 @@ async def _try_fill(page: Page, selectors: list, value: str, label: str) -> bool
     logger.warning("✗ %s — no selector matched", label)
     return False
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Registration form
+# ─────────────────────────────────────────────────────────────────────────────
 
-async def _dump_buttons(page: Page) -> None:
-    """Log every button/submit element so we can identify exact selectors."""
-    logger.info("=== BUTTON DUMP ===")
-    try:
-        handles = await page.query_selector_all(
-            "button, input[type='submit'], input[type='button'], a[role='button']"
-        )
-        if not handles:
-            logger.info("  (none found)")
-        for i, h in enumerate(handles):
-            try:
-                txt  = (await h.inner_text()).strip().replace("\n", " ")[:80]
-                typ  = await h.get_attribute("type") or ""
-                cls  = (await h.get_attribute("class") or "")[:80]
-                vis  = await h.is_visible()
-                logger.info("  [%d] vis=%-5s type=%-8s text=%r  class=%s",
-                            i, vis, typ, txt, cls)
-            except Exception:
-                pass
-    except Exception as e:
-        logger.error("Button dump failed: %s", e)
-    logger.info("=== END BUTTON DUMP ===")
-
-
-async def _trigger_registration_form(page: Page) -> None:
+async def _fill_registration_form(page: Page) -> None:
     """
-    Full registration sequence that forces the captcha to appear:
-
-      Step 1 — Click the "Sign up" tab (switches from login to registration).
-      Step 2 — Fill Email address field.
-      Step 3 — Fill "Enter your new password" field.
-      Step 4 — Fill "Confirm new password" field.
-      Step 5 — Tick the "I've read and agreed..." checkbox.
-               (Without this the Next button stays disabled and the captcha
-                never appears.)
-      Step 6 — Click the orange "Next" button.
+    Complete registration flow:
+      1. Sign up tab
+      2. Email
+      3. New password
+      4. Confirm new password
+      5. Agreement checkbox  ← CRITICAL: captcha won't appear without this
+      6. Next button
     """
-    WAIT = 2000   # ms between every step
+    W = 2000  # ms wait between steps
 
-    # ── Step 1 ── Sign up tab ────────────────────────────────────────────────
+    # ── 1. Sign up tab ───────────────────────────────────────────────────────
     await _try_click(page, [
-        # Text-based (most reliable)
-        "text=Sign up",
-        "text=Create account",
-        "text=Register",
-        "text=注册",
-        # Tab/link variants Xiaomi uses
-        ".tab-item:has-text('Sign up')",
-        ".tab-item:has-text('Register')",
-        "[role='tab']:has-text('Sign up')",
-        "[role='tab']:has-text('Register')",
-        "a:has-text('Sign up')",
-        "a:has-text('Register')",
-        "a[href*='register']",
+        "text=Sign up", "text=Create account", "text=Register", "text=注册",
+        ".tab-item:has-text('Sign up')", ".tab-item:has-text('Register')",
+        "[role='tab']:has-text('Sign up')", "[role='tab']:has-text('Register')",
+        "a:has-text('Sign up')", "a:has-text('Register')", "a[href*='register']",
         "button:has-text('Sign up')",
-        # Data attributes
-        "[data-testid='signup-tab']",
-        "[data-testid='register-tab']",
+        "[data-testid='signup-tab']", "[data-testid='register-tab']",
     ], "Sign up tab")
-    await page.wait_for_timeout(WAIT)
+    await page.wait_for_timeout(W)
 
-    # ── Step 2 ── Email ──────────────────────────────────────────────────────
+    # ── 2. Email ─────────────────────────────────────────────────────────────
     await _try_fill(page, [
-        "input[type='email']",
-        "input[name='email']",
-        "input[name='account']",
-        "input[placeholder*='email' i]",
-        "input[placeholder*='Email' i]",
-        "input[placeholder*='mail' i]",
-        "input[id*='email' i]",
-        # Fallback: first visible text input that isn't a password field
+        "input[type='email']", "input[name='email']", "input[name='account']",
+        "input[placeholder*='email' i]", "input[placeholder*='Email' i]",
+        "input[placeholder*='mail' i]", "input[id*='email' i]",
         "input[type='text']:visible",
-    ], "testuser_debug@example.com", "Email field")
-    await page.wait_for_timeout(WAIT)
+    ], "testuser_debug@example.com", "Email")
+    await page.wait_for_timeout(W)
 
-    # ── Step 3 ── New password ───────────────────────────────────────────────
-    # On multi-password forms the FIRST password field is "Enter your new password"
+    # ── 3. New password (first password field) ───────────────────────────────
     await _try_fill(page, [
-        "input[name='password']",
-        "input[name='newPassword']",
+        "input[name='password']", "input[name='newPassword']",
         "input[name='new_password']",
         "input[placeholder*='new password' i]",
         "input[placeholder*='Enter your new password' i]",
-        "input[placeholder*='password' i]",
-        "input[id*='password' i]",
-        # If there are two fields, nth(0) is always the first
+        "input[placeholder*='password' i]", "input[id*='password' i]",
         "(//input[@type='password'])[1]",
         "input[type='password']",
-    ], "DebugPass123!", "New password field")
-    await page.wait_for_timeout(WAIT)
+    ], "DebugPass123!", "New password")
+    await page.wait_for_timeout(W)
 
-    # ── Step 4 ── Confirm password ───────────────────────────────────────────
-    # The SECOND password field is "Confirm new password"
+    # ── 4. Confirm password (second password field) ──────────────────────────
     await _try_fill(page, [
-        "input[name='confirmPassword']",
-        "input[name='confirm_password']",
+        "input[name='confirmPassword']", "input[name='confirm_password']",
         "input[name='passwordConfirm']",
         "input[placeholder*='confirm' i]",
         "input[placeholder*='Confirm new password' i]",
-        # nth() picks the second password input when there are two
         "input[type='password'] >> nth=1",
         "(//input[@type='password'])[2]",
-    ], "DebugPass123!", "Confirm password field")
-    await page.wait_for_timeout(WAIT)
+    ], "DebugPass123!", "Confirm password")
+    await page.wait_for_timeout(W)
 
-    # ── Debug screenshot after filling ──────────────────────────────────────
+    # ── Debug screenshot (post-fill) ─────────────────────────────────────────
     await page.screenshot(path=DEBUG_FORM_PATH, full_page=True)
-    logger.info("Saved post-fill screenshot → %s", DEBUG_FORM_PATH)
+    logger.info("Post-fill screenshot → %s", DEBUG_FORM_PATH)
 
-    # ── Step 5 ── Agreement checkbox ─────────────────────────────────────────
-    # This is the small checkbox next to
-    # "I've read and agreed to the Xiaomi Account User Agreement..."
-    # Without ticking it, the Next button remains disabled.
+    # ── 5. Agreement checkbox ─────────────────────────────────────────────────
+    # CRITICAL: disabling the Next button until this is checked.
     await _try_click(page, [
-        # Checkbox by type
         "input[type='checkbox']",
-        # Common class patterns for this checkbox on Xiaomi's page
-        ".agreement-checkbox input",
-        ".agree-checkbox input",
-        ".policy-checkbox input",
-        ".checkbox input",
-        "label.agreement input",
-        "label.agree input",
-        # Text proximity selectors
-        "label:has-text('agree') input",
-        "label:has-text('Agreement') input",
+        ".agreement-checkbox input", ".agree-checkbox input",
+        ".policy-checkbox input", ".checkbox input",
+        "label.agreement input", "label.agree input",
+        "label:has-text('agree') input", "label:has-text('Agreement') input",
         "label:has-text('User Agreement') input",
         "[class*='agree'] input[type='checkbox']",
         "[class*='policy'] input[type='checkbox']",
-        # Fallback: any visible checkbox
         "input[type='checkbox']:visible",
     ], "Agreement checkbox")
-    await page.wait_for_timeout(WAIT)
+    await page.wait_for_timeout(W)
 
-    # ── Button dump (debug) ──────────────────────────────────────────────────
-    await _dump_buttons(page)
-
-    # ── Step 6 ── Next / Submit button ───────────────────────────────────────
+    # ── 6. Next button ────────────────────────────────────────────────────────
     await _try_click(page, [
-        # Exact text matches
-        "button:has-text('Next')",
-        "button:has-text('Continue')",
-        "button:has-text('Sign up')",
-        "button:has-text('Register')",
+        "button:has-text('Next')", "button:has-text('Continue')",
+        "button:has-text('Sign up')", "button:has-text('Register')",
         "button:has-text('Create')",
-        "button:has-text('下一步')",
-        "button:has-text('注册')",
+        "button:has-text('下一步')", "button:has-text('注册')",
         "button:has-text('确定')",
-        "text=Next",
-        "text=Continue",
-        # Type-based
-        "button[type='submit']",
-        "input[type='submit']",
-        # Xiaomi / NutUI CSS patterns
-        ".n-footer .n-btn",
-        ".n-footer button",
-        ".submit-btn",
-        ".btn-submit",
-        ".btn-primary",
-        ".next-btn",
-        # Wildcard class attributes
-        "[class*='submit']",
-        "[class*='next']",
-        "[class*='primary']",
-        # ARIA / data
-        "[aria-label*='next' i]",
-        "[aria-label*='submit' i]",
-        "[data-testid*='next' i]",
-        "[data-testid*='submit' i]",
-        # Absolute last resort: first visible button
+        "text=Next", "text=Continue",
+        "button[type='submit']", "input[type='submit']",
+        ".n-footer .n-btn", ".n-footer button",
+        ".submit-btn", ".btn-submit", ".btn-primary", ".next-btn",
+        "[class*='submit']", "[class*='next']", "[class*='primary']",
+        "[aria-label*='next' i]", "[aria-label*='submit' i]",
+        "[data-testid*='next' i]", "[data-testid*='submit' i]",
         "button:visible",
-    ], "Next / Submit button")
+    ], "Next button")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Main entry point
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Main run loop
-# ---------------------------------------------------------------------------
 async def run(headless: bool = True) -> None:
     async with async_playwright() as pw:
         browser, context = await launch_stealth_context(pw, headless=headless)
@@ -539,38 +557,39 @@ async def run(headless: bool = True) -> None:
         try:
             page = await context.new_page()
 
+            # ── Navigate ──────────────────────────────────────────────────────
             logger.info("Opening Xiaomi login page…")
             await page.goto(XIAOMI_LOGIN_URL, wait_until="domcontentloaded")
             await page.wait_for_load_state("networkidle")
             logger.info("Landed on: %s", page.url)
 
-            # Walk through the form to trigger the captcha.
-            logger.info("Starting registration flow…")
-            await _trigger_registration_form(page)
+            # ── Registration form ─────────────────────────────────────────────
+            logger.info("Filling registration form…")
+            await _fill_registration_form(page)
 
-            # ── Wait 10 s AFTER clicking Next so the captcha anchor renders ──
-            logger.info("Waiting 10 s for reCAPTCHA anchor to render…")
+            # ── Wait for reCAPTCHA anchor to render after Next ────────────────
+            logger.info("Waiting 10 s for reCAPTCHA anchor…")
             await page.wait_for_timeout(10000)
-
-            # Scroll to bottom in case the widget is below the fold.
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
 
-            # ── Dump raw iframe tags so we can see what loaded ─────────────
-            html         = await page.content()
-            iframe_tags  = re.findall(r"<iframe[^>]*>", html, re.IGNORECASE)
-            logger.info("=== RAW <iframe> TAGS FOUND: %d ===", len(iframe_tags))
+            # ── Debug: dump iframe tags from page source ──────────────────────
+            html        = await page.content()
+            iframe_tags = re.findall(r"<iframe[^>]*>", html, re.IGNORECASE)
+            logger.info("=== IFRAME DUMP (%d found) ===", len(iframe_tags))
             for i, tag in enumerate(iframe_tags):
                 logger.info("  [%d] %s", i, tag)
-            if not iframe_tags:
-                logger.info("  (none)")
             logger.info("=== END IFRAME DUMP ===")
 
-            # ── Solve: click anchor → wait 3 s → crop bframe → YOLO ───────
-            await solve_captcha(page)
+            # ── Multi-round captcha solver ────────────────────────────────────
+            solved = await solve_captcha_loop(page)
+            if solved:
+                logger.info("Registration captcha passed — continuing flow.")
+            else:
+                logger.error("Registration captcha could not be solved.")
 
             if not headless:
-                logger.info("Press Ctrl+C to exit.")
+                logger.info("Headed mode — press Ctrl+C to exit.")
                 await asyncio.Event().wait()
 
         finally:
