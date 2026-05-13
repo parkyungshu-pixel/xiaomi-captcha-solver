@@ -395,22 +395,78 @@ async def _trigger_registration_form(page: Page) -> bool:
     if not filled_password:
         logger.warning("Could not find password input field.")
 
-    # -- Step 4: click "Next" / "Continue" to trigger reCAPTCHA ---------------
+    # -- Debug screenshot after filling the form ------------------------------
+    # Saved as debug_form.png so we can verify the fields were actually filled
+    # before we attempt to click Next.
+    await page.screenshot(path="debug_form.png", full_page=True)
+    logger.info("Saved post-fill screenshot to debug_form.png")
+
+    # -- Step 4a: log every visible button on the page so we know exact text --
+    # This is the most reliable way to discover the real label Xiaomi uses for
+    # the submit / next button (it can vary by locale and page variant).
+    logger.info("=== ALL BUTTONS on page (text / type / class) ===")
+    try:
+        btn_handles = await page.query_selector_all("button, input[type='submit'], input[type='button'], a[role='button']")
+        if not btn_handles:
+            logger.info("  (no button elements found)")
+        for idx, btn in enumerate(btn_handles):
+            try:
+                txt   = (await btn.inner_text()).strip().replace("\n", " ")
+                btype = await btn.get_attribute("type") or ""
+                bcls  = await btn.get_attribute("class") or ""
+                bval  = await btn.get_attribute("value") or ""
+                visible = await btn.is_visible()
+                logger.info(
+                    "  [%d] visible=%-5s type=%-8s text=%r  value=%r  class=%s",
+                    idx, visible, btype, txt[:80], bval[:40], bcls[:80],
+                )
+            except Exception as e:
+                logger.warning("  [%d] could not inspect button: %s", idx, e)
+    except Exception as e:
+        logger.error("Failed to enumerate buttons: %s", e)
+    logger.info("=== END BUTTON DUMP ===")
+
+    # -- Step 4b: click "Next" / "Continue" to trigger reCAPTCHA --------------
     next_selectors = [
+        # Text-based (most reliable when text is known)
         "button:has-text('Next')",
         "button:has-text('Continue')",
         "button:has-text('Sign up')",
         "button:has-text('Register')",
-        "button[type='submit']",
-        "input[type='submit']",
+        "button:has-text('Create')",
+        "button:has-text('下一步')",        # Chinese "Next step"
+        "button:has-text('注册')",           # Chinese "Register"
+        "button:has-text('确定')",           # Chinese "Confirm"
         "text=Next",
         "text=Continue",
+        # Type / role based
+        "button[type='submit']",
+        "input[type='submit']",
+        # Xiaomi / NutUI class patterns observed in the wild
+        ".n-footer .n-btn",
+        ".n-footer button",
+        ".submit-btn",
+        ".btn-primary",
+        ".next-btn",
+        "[class*='submit']",
+        "[class*='next']",
+        "[class*='primary']",
+        # ARIA / data attributes
+        "[aria-label*='next' i]",
+        "[aria-label*='submit' i]",
+        "[aria-label*='continue' i]",
+        "[data-testid*='next' i]",
+        "[data-testid*='submit' i]",
+        # Last-resort: any button that is visible and enabled
+        "button:visible",
     ]
     clicked_next = False
     for sel in next_selectors:
         try:
             locator = page.locator(sel).first
             if await locator.count() == 0:
+                continue
+            if not await locator.is_visible():
                 continue
             await locator.click(timeout=3000)
             clicked_next = True
@@ -421,7 +477,8 @@ async def _trigger_registration_form(page: Page) -> bool:
 
     if not clicked_next:
         logger.warning(
-            "Could not find Next/Submit button — reCAPTCHA may not appear."
+            "Could not find Next/Submit button — reCAPTCHA may not appear. "
+            "Check the button dump above and update next_selectors."
         )
 
     return clicked_signup or filled_email or clicked_next
