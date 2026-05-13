@@ -20,6 +20,8 @@ import asyncio
 import logging
 import random
 import re
+import string
+import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -116,9 +118,8 @@ ANTI_STUCK_WAIT_MS  = 1000
 TILE_DRAIN_WAIT_MS  = 1000  # ms to wait after each click before re-detecting
 MAX_TILE_CLICKS     = 3     # maximum click attempts per individual tile coordinate
 
-# Session persistence — saves cookies/localStorage so future runs are
-# already "recognised" by reCAPTCHA / Xiaomi, reducing captcha frequency.
-AUTH_JSON_PATH      = "auth.json"
+# Max browser restart attempts on unhandled crash
+MAX_RESTART_ATTEMPTS = 3
 
 # Fallback full-page crop when bframe bounding box cannot be found
 CAPTCHA_CROP_FALLBACK: Tuple[int, int, int, int] = (0, 0, 1080, 1920)
@@ -153,6 +154,37 @@ def _clamp_box(
 def _jitter(coord: float, px: int = HUMAN_JITTER_PX) -> float:
     """Add a small random offset to a click coordinate."""
     return coord + random.uniform(-px, px)
+
+
+def _generate_credentials() -> tuple[str, str]:
+    """Generate a unique random email and a strong random password for this run.
+
+    No external library required — uses only stdlib `random`, `string`, `uuid`.
+
+    Returns:
+        (email, password)  — both are different on every call.
+    """
+    # --- email ---
+    # Format: <8-char alphanum>.<4-char hex>@<domain>
+    local_part = "".join(random.choices(string.ascii_lowercase + string.digits, k=8))
+    tag        = uuid.uuid4().hex[:6]
+    domains    = ["gmail.com", "yahoo.com", "outlook.com", "proton.me", "hotmail.com"]
+    email      = f"{local_part}.{tag}@{random.choice(domains)}"
+
+    # --- password ---
+    # At least 1 uppercase, 1 lowercase, 1 digit, 1 special char; 12 chars total.
+    special   = "!@#$%^&*"
+    pwd_chars = (
+        random.choices(string.ascii_uppercase, k=2)
+        + random.choices(string.ascii_lowercase, k=5)
+        + random.choices(string.digits, k=3)
+        + random.choices(special, k=2)
+    )
+    random.shuffle(pwd_chars)
+    password = "".join(pwd_chars)
+
+    logger.info("Generated credentials — email: %s", email)
+    return email, password
 
 # ─────────────────────────────────────────────────────────────────────────────
 # YOLO helpers
@@ -676,13 +708,10 @@ async def solve_captcha_loop(page: Page) -> bool:
 async def launch_stealth_context(playwright, headless: bool = True):
     """Launch a stealth Chromium context.
 
-    Session persistence via AUTH_JSON_PATH (auth.json):
-      • If auth.json exists it is loaded as storage_state so cookies,
-        localStorage and sessionStorage are restored.  reCAPTCHA and Xiaomi
-        will treat the browser as a recognised session, reducing or skipping
-        the image challenge entirely.
-      • Call `await context.storage_state(path=AUTH_JSON_PATH)` at any point
-        to persist the current session (see run() below).
+    Always starts a completely fresh incognito session — no cookies, no
+    localStorage, no cached state from previous runs.  This avoids crashes
+    caused by stale or corrupted session files (auth.json) and ensures every
+    registration attempt looks like a brand-new browser to Xiaomi / reCAPTCHA.
     """
     browser = await playwright.chromium.launch(
         headless=headless,
@@ -693,14 +722,7 @@ async def launch_stealth_context(playwright, headless: bool = True):
         ],
     )
 
-    # Load saved session if it exists
-    auth_path = Path(AUTH_JSON_PATH)
-    storage   = str(auth_path) if auth_path.exists() else None
-    if storage:
-        logger.info("Restoring session from %s", AUTH_JSON_PATH)
-    else:
-        logger.info("No saved session found — starting fresh (%s)", AUTH_JSON_PATH)
-
+    # Always start completely fresh — no storage_state loaded or saved.
     context = await browser.new_context(
         user_agent=USER_AGENT,
         viewport=VIEWPORT,
@@ -708,9 +730,10 @@ async def launch_stealth_context(playwright, headless: bool = True):
         timezone_id=TIMEZONE_ID,
         is_mobile=True,
         has_touch=True,
-        storage_state=storage,   # None = fresh session; str path = restore
+        # storage_state intentionally omitted → pure incognito every run
     )
     await Stealth().apply_stealth_async(context)
+    logger.info("Browser context created (pure fresh / incognito)")
     return browser, context
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -752,12 +775,12 @@ async def _try_fill(page: Page, selectors: list, value: str, label: str) -> bool
 # Registration form
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def _fill_registration_form(page: Page) -> None:
+async def _fill_registration_form(page: Page, email: str, password: str) -> None:
     """
     Complete registration flow:
       1. Sign up tab
-      2. Email
-      3. New password
+      2. Email  (uses the dynamically-generated address passed in)
+      3. New password  (uses the dynamically-generated password passed in)
       4. Confirm new password
       5. Agreement checkbox  ← CRITICAL: captcha won't appear without this
       6. Next button
@@ -781,7 +804,7 @@ async def _fill_registration_form(page: Page) -> None:
         "input[placeholder*='email' i]", "input[placeholder*='Email' i]",
         "input[placeholder*='mail' i]", "input[id*='email' i]",
         "input[type='text']:visible",
-    ], "testuser_debug@example.com", "Email")
+    ], email, "Email")
     await page.wait_for_timeout(W)
 
     # ── 3. New password (first password field) ───────────────────────────────
@@ -793,7 +816,7 @@ async def _fill_registration_form(page: Page) -> None:
         "input[placeholder*='password' i]", "input[id*='password' i]",
         "(//input[@type='password'])[1]",
         "input[type='password']",
-    ], "DebugPass123!", "New password")
+    ], password, "New password")
     await page.wait_for_timeout(W)
 
     # ── 4. Confirm password (second password field) ──────────────────────────
@@ -804,7 +827,7 @@ async def _fill_registration_form(page: Page) -> None:
         "input[placeholder*='Confirm new password' i]",
         "input[type='password'] >> nth=1",
         "(//input[@type='password'])[2]",
-    ], "DebugPass123!", "Confirm password")
+    ], password, "Confirm password")
     await page.wait_for_timeout(W)
 
     # ── Debug screenshot (post-fill) ─────────────────────────────────────────
@@ -847,7 +870,15 @@ async def _fill_registration_form(page: Page) -> None:
 # Main entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
-async def run(headless: bool = True) -> None:
+async def run(headless: bool = True) -> bool:
+    """Single-attempt browser session.
+
+    Returns True if the captcha was solved, False otherwise.
+    Raises on unexpected browser/page crashes so the caller can restart.
+    """
+    # Generate fresh credentials for this attempt
+    email, password = _generate_credentials()
+
     async with async_playwright() as pw:
         browser, context = await launch_stealth_context(pw, headless=headless)
         page: Optional[Page] = None
@@ -861,8 +892,8 @@ async def run(headless: bool = True) -> None:
             logger.info("Landed on: %s", page.url)
 
             # ── Registration form ─────────────────────────────────────────────
-            logger.info("Filling registration form…")
-            await _fill_registration_form(page)
+            logger.info("Filling registration form (email=%s)…", email)
+            await _fill_registration_form(page, email, password)
 
             # ── Wait for reCAPTCHA anchor to render after Next ────────────────
             logger.info("Waiting 10 s for reCAPTCHA anchor…")
@@ -882,10 +913,6 @@ async def run(headless: bool = True) -> None:
             solved = await solve_captcha_loop(page)
             if solved:
                 logger.info("Registration captcha passed — continuing flow.")
-                # ── Persist session so future runs benefit from a recognised
-                #    browser fingerprint / cookie jar (reduces captcha load).
-                await context.storage_state(path=AUTH_JSON_PATH)
-                logger.info("Session saved → %s", AUTH_JSON_PATH)
             else:
                 logger.error("Registration captcha could not be solved.")
 
@@ -893,18 +920,54 @@ async def run(headless: bool = True) -> None:
                 logger.info("Headed mode — press Ctrl+C to exit.")
                 await asyncio.Event().wait()
 
+            return solved
+
         finally:
-            if page:
-                await page.close()
-            await context.close()
-            await browser.close()
+            # Always clean up — ensures no zombie processes / leaked contexts
+            try:
+                if page and not page.is_closed():
+                    await page.close()
+            except Exception:
+                pass
+            try:
+                await context.close()
+            except Exception:
+                pass
+            try:
+                await browser.close()
+            except Exception:
+                pass
 
 
 def main() -> None:
-    try:
-        asyncio.run(run(headless=True))
-    except KeyboardInterrupt:
-        logger.info("Interrupted.")
+    """Entry point with automatic restart on crash (up to MAX_RESTART_ATTEMPTS)."""
+    for attempt in range(1, MAX_RESTART_ATTEMPTS + 1):
+        logger.info("═══ Attempt %d / %d ═══", attempt, MAX_RESTART_ATTEMPTS)
+        try:
+            solved = asyncio.run(run(headless=True))
+            if solved:
+                logger.info("✓ All done — captcha solved on attempt %d.", attempt)
+                break
+            else:
+                logger.warning(
+                    "Attempt %d finished without solving; "
+                    "restarting with fresh browser and new credentials…",
+                    attempt,
+                )
+        except KeyboardInterrupt:
+            logger.info("Interrupted by user.")
+            break
+        except Exception as exc:
+            logger.error(
+                "Attempt %d crashed: %s — restarting browser in 3 s…",
+                attempt, exc,
+                exc_info=True,
+            )
+            if attempt < MAX_RESTART_ATTEMPTS:
+                import time
+                time.sleep(3)
+            else:
+                logger.error("All %d attempts failed.", MAX_RESTART_ATTEMPTS)
 
 
 if __name__ == "__main__":
