@@ -65,23 +65,20 @@ MAX_CAPTCHA_ROUNDS  = 10    # give up after this many rounds
 HUMAN_JITTER_PX     = 5     # ±px random offset on every click
 ROUND_WAIT_MS       = 3000  # ms to wait for the grid to load each round
 
-# Human-like timing constants
-# Visual Processing Cooldown: simulates the time a human takes to recognize
-# a target and decide to tap it.  Applied once per target BEFORE clicking.
-VISUAL_COOLDOWN_MIN_S = 1.5
-VISUAL_COOLDOWN_MAX_S = 3.0
+# Human-like timing constants (kept tight to avoid challenge expiry)
+# Visual Processing Cooldown: short thinking pause before each tap.
+VISUAL_COOLDOWN_MIN_S = 0.5
+VISUAL_COOLDOWN_MAX_S = 1.0
 
-# Dynamic Tap Interval: random pause BETWEEN consecutive tile taps inside the
-# same grid so the bot doesn't fire like a machine gun.
-TAP_INTERVAL_MIN_S  = 0.8
-TAP_INTERVAL_MAX_S  = 1.5
+# Dynamic Tap Interval: random pause BETWEEN consecutive tile taps.
+TAP_INTERVAL_MIN_S  = 0.4
+TAP_INTERVAL_MAX_S  = 0.8
 
-# Anti-Stuck Scan: after the last tap on a grid, wait this long before
-# re-scanning for replacement tiles.  Only call Verify once 0 targets remain.
-ANTI_STUCK_WAIT_MS  = 3000
+# Anti-Stuck Scan: after the last tap, wait this long before final rescan.
+ANTI_STUCK_WAIT_MS  = 1000
 
 # Tile-drain inner loop
-TILE_DRAIN_WAIT_MS  = 2000  # ms to wait after each click before re-detecting
+TILE_DRAIN_WAIT_MS  = 1000  # ms to wait after each click before re-detecting
 MAX_TILE_CLICKS     = 3     # maximum click attempts per individual tile coordinate
 
 # Session persistence — saves cookies/localStorage so future runs are
@@ -255,6 +252,42 @@ async def _click_anchor_checkbox(page: Page) -> bool:
         except Exception as exc:
             logger.warning("Anchor click failed (%s): %s", sel, exc)
     logger.warning("✗ Anchor checkbox not found")
+    return False
+
+
+async def _challenge_expired(page: Page) -> bool:
+    """Check whether the reCAPTCHA challenge has expired.
+
+    When the user takes too long, the bframe shows a message like
+    "Verification challenge expired. Check the checkbox again." and the
+    challenge grid disappears.  We detect this by looking for the error text
+    inside the bframe OR by noticing the anchor checkbox has reset to
+    unchecked state while the bframe is gone.
+    """
+    # Method 1: look for expiry text inside the bframe
+    for sel in BFRAME_SELS:
+        try:
+            if await page.locator(sel).count() == 0:
+                continue
+            frame = page.frame_locator(sel)
+            error_msg = frame.locator(".rc-imageselect-error-select-more, "
+                                       ".rc-imageselect-incorrect-response, "
+                                       "[class*='expired'], "
+                                       "[class*='error']")
+            if await error_msg.count() > 0:
+                txt = (await error_msg.first.inner_text()).strip().lower()
+                if "expired" in txt or "check the checkbox" in txt:
+                    logger.warning("Challenge expired detected: %r", txt)
+                    return True
+        except Exception:
+            pass
+
+    # Method 2: bframe gone + anchor visible again = expired / failed
+    if not await _bframe_is_visible(page) and await _anchor_is_visible(page):
+        # The anchor reappeared without us clicking Verify — likely expired
+        logger.warning("bframe disappeared + anchor visible → likely expired")
+        return True
+
     return False
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -438,14 +471,8 @@ async def solve_captcha_loop(page: Page) -> bool:
                 break
 
         # ── Anti-Stuck Scan ──────────────────────────────────────────────────
-        # After the last tap in the drain loop, wait ANTI_STUCK_WAIT_MS (3 s)
-        # so any replacement tiles that were queued to appear have time to
-        # fully render.  Then do one final YOLO scan.  Only proceed to
-        # Next / Verify if zero targets remain — otherwise loop again.
-        logger.info(
-            "[round %d] Anti-stuck cooldown: waiting %d ms for replacement tiles…",
-            rnd, ANTI_STUCK_WAIT_MS,
-        )
+        # Quick rescan after drain to catch any late replacement tiles.
+        logger.info("[round %d] Anti-stuck rescan (%d ms)…", rnd, ANTI_STUCK_WAIT_MS)
         await page.wait_for_timeout(ANTI_STUCK_WAIT_MS)
 
         await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
@@ -465,19 +492,18 @@ async def solve_captcha_loop(page: Page) -> bool:
                 "re-entering drain loop",
                 rnd, len(remaining),
             )
-            # Inject the new detections back into the drain loop by continuing
-            # the round (the drain loop will pick them up on the next pass).
-            # We do this by NOT breaking out here; instead we fall through to
-            # the button check so the outer for-loop iterates naturally.
-            # If the button says "next"/"verify" at this point, that's fine too.
 
         else:
             logger.info("[round %d] Anti-stuck scan: 0 targets — grid is clean", rnd)
 
-        # Brief settle pause before reading the bframe button
-        await page.wait_for_timeout(800)
+        # ── Check for challenge expiry ────────────────────────────────────────
+        if await _challenge_expired(page):
+            logger.warning("[round %d] Challenge EXPIRED — re-clicking anchor…", rnd)
+            await _click_anchor_checkbox(page)
+            await page.wait_for_timeout(ROUND_WAIT_MS)
+            continue  # restart round with fresh challenge
 
-        # Step 5 ── read bframe button and act ────────────────────────────────
+        # Step 5 ── read bframe button and act (FAST SUBMIT) ──────────────────
         btn_text = await _get_bframe_button_text(page)
         logger.info("[round %d] bframe button text: %r", rnd, btn_text)
 
@@ -498,9 +524,14 @@ async def solve_captcha_loop(page: Page) -> bool:
                 logger.info("✓ CAPTCHA SOLVED on round %d", rnd)
                 return True
 
-            # Challenge still showing — may have been wrong, continue
+            # Challenge still showing — may have been wrong or expired
+            if await _challenge_expired(page):
+                logger.warning("[round %d] Expired after Verify — re-clicking anchor…", rnd)
+                await _click_anchor_checkbox(page)
+                await page.wait_for_timeout(ROUND_WAIT_MS)
+                continue
             logger.warning("[round %d] bframe still visible after Verify — retrying", rnd)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(1000)
             continue
 
         else:
