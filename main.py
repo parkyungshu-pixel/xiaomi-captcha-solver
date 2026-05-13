@@ -51,14 +51,7 @@ DEBUG_FORM_PATH   = "debug_form.png"   # after fields are filled, before Next
 # ---------------------------------------------------------------------------
 # Captcha / YOLO config
 # ---------------------------------------------------------------------------
-# Ordered list of CSS selectors tried to locate the reCAPTCHA bframe iframe.
-RECAPTCHA_CHALLENGE_SELECTORS = (
-    'iframe[src*="recaptcha/api2/bframe"]',
-    'iframe[src*="recaptcha/enterprise/bframe"]',
-    'iframe[title*="recaptcha challenge"]',
-)
-
-# Fallback crop used when the iframe bounding-box lookup fails.
+# Fallback crop used when the bframe bounding-box lookup fails.
 # (left, top, right, bottom) in screenshot coordinates.
 CAPTCHA_CROP_BOX: Tuple[int, int, int, int] = (0, 0, 1080, 1920)
 
@@ -131,35 +124,140 @@ def _detect_targets(
 
 
 # ---------------------------------------------------------------------------
-# reCAPTCHA iframe locator
+# reCAPTCHA helpers
 # ---------------------------------------------------------------------------
-async def _locate_recaptcha_box(page: Page) -> Optional[Tuple[int, int, int, int]]:
-    for sel in RECAPTCHA_CHALLENGE_SELECTORS:
-        loc = page.locator(sel)
+
+def _clamp_box(box: Tuple[int, int, int, int],
+               max_w: int = 16384,
+               max_h: int = 16384) -> Tuple[int, int, int, int]:
+    """Clamp a (left, top, right, bottom) crop box so every coordinate is
+    non-negative and right > left, bottom > top.  Negative viewport positions
+    can occur when the iframe is partially off-screen."""
+    left   = max(0, box[0])
+    top    = max(0, box[1])
+    right  = max(left + 1, min(box[2], max_w))
+    bottom = max(top  + 1, min(box[3], max_h))
+    return (left, top, right, bottom)
+
+
+async def _get_bounding_box(page: Page,
+                            selectors: Tuple[str, ...]) -> Optional[Tuple[int, int, int, int]]:
+    """Try each selector in turn; return the first valid bounding box found."""
+    for sel in selectors:
         try:
+            loc = page.locator(sel)
             if await loc.count() == 0:
                 continue
-            box = await loc.first.bounding_box()
+            raw = await loc.first.bounding_box()
         except Exception:
             continue
-        if not box:
+        if not raw:
             continue
-        left, top = int(box["x"]), int(box["y"])
-        right, bottom = left + int(box["width"]), top + int(box["height"])
-        logger.info("reCAPTCHA iframe found via %s → (%d,%d,%d,%d)",
-                    sel, left, top, right, bottom)
+        left  = int(raw["x"])
+        top   = int(raw["y"])
+        right  = left + int(raw["width"])
+        bottom = top  + int(raw["height"])
+        logger.info("Bounding box via %s → (%d,%d,%d,%d)", sel, left, top, right, bottom)
         return (left, top, right, bottom)
     return None
+
+
+# Selectors for the reCAPTCHA ANCHOR iframe (the "I'm not a robot" checkbox).
+RECAPTCHA_ANCHOR_SELECTORS = (
+    'iframe[title="reCAPTCHA"]',
+    'iframe[src*="recaptcha/api2/anchor"]',
+    'iframe[src*="recaptcha/enterprise/anchor"]',
+)
+
+# Selectors for the reCAPTCHA CHALLENGE iframe (the image grid popup).
+RECAPTCHA_BFRAME_SELECTORS = (
+    'iframe[src*="recaptcha/api2/bframe"]',
+    'iframe[src*="recaptcha/enterprise/bframe"]',
+    'iframe[title*="recaptcha challenge"]',
+)
+
+
+async def _click_recaptcha_anchor(page: Page) -> bool:
+    """Find the reCAPTCHA anchor iframe, switch into it, and click the
+    checkbox.  This is what triggers the image-selection challenge to appear.
+
+    Returns True if the checkbox was successfully clicked.
+    """
+    for sel in RECAPTCHA_ANCHOR_SELECTORS:
+        try:
+            loc = page.locator(sel)
+            if await loc.count() == 0:
+                continue
+
+            # frame_locator lets us query elements inside a cross-origin iframe
+            frame = page.frame_locator(sel)
+            checkbox = frame.locator("#recaptcha-anchor")
+            if await checkbox.count() == 0:
+                # fallback: try any role=checkbox inside the iframe
+                checkbox = frame.locator("[role='checkbox']")
+            if await checkbox.count() == 0:
+                logger.warning("No checkbox found inside anchor iframe (%s)", sel)
+                continue
+
+            await checkbox.click(timeout=5000)
+            logger.info("✓ reCAPTCHA anchor checkbox clicked via iframe: %s", sel)
+            return True
+        except Exception as exc:
+            logger.warning("Could not click anchor via %s: %s", sel, exc)
+            continue
+
+    logger.warning("✗ reCAPTCHA anchor iframe not found — captcha may not pop up")
+    return False
+
+
+async def _locate_challenge_box(page: Page) -> Optional[Tuple[int, int, int, int]]:
+    """Return the bounding box of the reCAPTCHA challenge (bframe) iframe,
+    clamped to non-negative coordinates."""
+    raw = await _get_bounding_box(page, RECAPTCHA_BFRAME_SELECTORS)
+    if raw is None:
+        return None
+    clamped = _clamp_box(raw)
+    if clamped != raw:
+        logger.info("Clamped challenge box %s → %s", raw, clamped)
+    return clamped
 
 
 # ---------------------------------------------------------------------------
 # YOLO captcha solver
 # ---------------------------------------------------------------------------
 async def solve_captcha(page: Page) -> bool:
-    crop_box = await _locate_recaptcha_box(page)
+    """Full two-phase reCAPTCHA solve:
+
+    Phase 1 — Trigger the image challenge:
+        a. Find the reCAPTCHA anchor iframe and click its checkbox.
+        b. Wait 3 s for the image-selection grid to fully render.
+
+    Phase 2 — Detect and click targets:
+        a. Take a fresh full-page screenshot AFTER the grid is visible.
+        b. Get the bframe bounding box and crop captcha_crop.png from it.
+        c. Run YOLOv8 on the crop to detect TARGET_CLASSES objects.
+        d. Click each detection center via page.mouse.click().
+    """
+    # ── Phase 1: click the checkbox to open the challenge ───────────────────
+    logger.info("Phase 1: clicking reCAPTCHA anchor checkbox…")
+    await _click_recaptcha_anchor(page)
+
+    # Wait for the image challenge popup (bframe) to fully load.
+    logger.info("Waiting 3 s for image challenge to render…")
+    await page.wait_for_timeout(3000)
+
+    # ── Phase 2a: fresh screenshot now that the grid is visible ─────────────
+    await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
+    logger.info("Saved post-challenge screenshot → %s", SCREENSHOT_PATH)
+
+    # ── Phase 2b: locate bframe and crop ────────────────────────────────────
+    crop_box = await _locate_challenge_box(page)
     if crop_box is None:
-        logger.warning("reCAPTCHA iframe not found — using fallback crop %s", CAPTCHA_CROP_BOX)
-        crop_box = CAPTCHA_CROP_BOX
+        logger.warning("bframe not found — falling back to full-page crop %s",
+                       CAPTCHA_CROP_BOX)
+        crop_box = _clamp_box(CAPTCHA_CROP_BOX)
+
+    logger.info("Using crop box: %s", crop_box)
 
     try:
         crop_path = _crop_captcha(SCREENSHOT_PATH, crop_box, CAPTCHA_CROP_PATH)
@@ -167,6 +265,7 @@ async def solve_captcha(page: Page) -> bool:
         logger.error(exc)
         return False
 
+    # ── Phase 2c: YOLO inference ─────────────────────────────────────────────
     loop       = asyncio.get_running_loop()
     detections = await loop.run_in_executor(
         None, _detect_targets, crop_path, (crop_box[0], crop_box[1])
@@ -179,9 +278,13 @@ async def solve_captcha(page: Page) -> bool:
 
     logger.info("YOLO found %d target(s):", len(detections))
     for label, conf, cx, cy in detections:
-        logger.info("  %-15s conf=%.2f  center=(%.1f, %.1f)", label, conf, cx, cy)
+        logger.info("  %-15s conf=%.2f  viewport=(%.1f, %.1f)", label, conf, cx, cy)
 
+    # ── Phase 2d: click each detected object ─────────────────────────────────
     for label, _, cx, cy in detections:
+        # Extra safety: clamp click coords to viewport bounds
+        cx = max(0.0, min(cx, float(VIEWPORT["width"]  - 1)))
+        cy = max(0.0, min(cy, float(VIEWPORT["height"] - 1)))
         logger.info("Clicking '%s' at (%.1f, %.1f)", label, cx, cy)
         await page.mouse.click(cx, cy)
         await asyncio.sleep(CLICK_DELAY_SECONDS)
@@ -445,15 +548,15 @@ async def run(headless: bool = True) -> None:
             logger.info("Starting registration flow…")
             await _trigger_registration_form(page)
 
-            # ── Wait 10 s AFTER clicking Next so the captcha has time to load ──
-            logger.info("Waiting 10 s for captcha to render…")
+            # ── Wait 10 s AFTER clicking Next so the captcha anchor renders ──
+            logger.info("Waiting 10 s for reCAPTCHA anchor to render…")
             await page.wait_for_timeout(10000)
 
             # Scroll to bottom in case the widget is below the fold.
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
 
-            # ── Dump raw iframe tags from page source ──────────────────────
+            # ── Dump raw iframe tags so we can see what loaded ─────────────
             html         = await page.content()
             iframe_tags  = re.findall(r"<iframe[^>]*>", html, re.IGNORECASE)
             logger.info("=== RAW <iframe> TAGS FOUND: %d ===", len(iframe_tags))
@@ -463,11 +566,7 @@ async def run(headless: bool = True) -> None:
                 logger.info("  (none)")
             logger.info("=== END IFRAME DUMP ===")
 
-            # ── Full-page screenshot ───────────────────────────────────────
-            await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
-            logger.info("Saved screenshot → %s", SCREENSHOT_PATH)
-
-            # ── YOLO solve ────────────────────────────────────────────────
+            # ── Solve: click anchor → wait 3 s → crop bframe → YOLO ───────
             await solve_captcha(page)
 
             if not headless:
