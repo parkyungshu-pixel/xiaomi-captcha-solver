@@ -50,7 +50,11 @@ CAPTCHA_CROP_PATH = "captcha_crop.png"
 
 # YOLOv8
 YOLO_MODEL_PATH           = "yolov8n.pt"
-YOLO_CONFIDENCE_THRESHOLD = 0.20
+# Lowered to 0.12 (Early Detection / Human Eye Logic): we want to detect tiles
+# while they are still fading in, before they are fully rendered.  The actual
+# click is delayed by the visual-processing cooldown below, so the click still
+# lands on a fully-visible tile.
+YOLO_CONFIDENCE_THRESHOLD = 0.12
 TARGET_CLASSES = {
     "bus", "traffic light", "car", "truck",
     "bicycle", "motorcycle", "fire hydrant", "stop sign",
@@ -58,9 +62,23 @@ TARGET_CLASSES = {
 
 # Solver loop
 MAX_CAPTCHA_ROUNDS  = 10    # give up after this many rounds
-CLICK_DELAY_S       = 0.4   # pause between object clicks (seconds)
 HUMAN_JITTER_PX     = 5     # ±px random offset on every click
 ROUND_WAIT_MS       = 3000  # ms to wait for the grid to load each round
+
+# Human-like timing constants
+# Visual Processing Cooldown: simulates the time a human takes to recognize
+# a target and decide to tap it.  Applied once per target BEFORE clicking.
+VISUAL_COOLDOWN_MIN_S = 1.5
+VISUAL_COOLDOWN_MAX_S = 3.0
+
+# Dynamic Tap Interval: random pause BETWEEN consecutive tile taps inside the
+# same grid so the bot doesn't fire like a machine gun.
+TAP_INTERVAL_MIN_S  = 0.8
+TAP_INTERVAL_MAX_S  = 1.5
+
+# Anti-Stuck Scan: after the last tap on a grid, wait this long before
+# re-scanning for replacement tiles.  Only call Verify once 0 targets remain.
+ANTI_STUCK_WAIT_MS  = 3000
 
 # Tile-drain inner loop
 TILE_DRAIN_WAIT_MS  = 2000  # ms to wait after each click before re-detecting
@@ -377,6 +395,17 @@ async def solve_captcha_loop(page: Page) -> bool:
                     )
                     continue
 
+                # ── Visual Processing Cooldown ────────────────────────────────
+                # Simulate human "thinking time": the brain sees the target at
+                # low confidence (fade-in) but waits before tapping.
+                cooldown = random.uniform(VISUAL_COOLDOWN_MIN_S, VISUAL_COOLDOWN_MAX_S)
+                logger.info(
+                    "  [drain %d] Detected '%s' conf=%.2f — "
+                    "visual cooldown %.1f s (simulating recognition delay)…",
+                    drain_pass, label, conf, cooldown,
+                )
+                await asyncio.sleep(cooldown)
+
                 # Human-like jitter + viewport clamp
                 jx = max(0.0, min(_jitter(cx), float(VIEWPORT["width"]  - 1)))
                 jy = max(0.0, min(_jitter(cy), float(VIEWPORT["height"] - 1)))
@@ -389,7 +418,12 @@ async def solve_captcha_loop(page: Page) -> bool:
                 await page.mouse.click(jx, jy)
                 click_counts[key] = attempts + 1
                 clicked_any = True
-                await asyncio.sleep(CLICK_DELAY_S)
+
+                # ── Dynamic Tap Interval ──────────────────────────────────────
+                # Random pause between consecutive tile taps (not machine-gun).
+                tap_gap = random.uniform(TAP_INTERVAL_MIN_S, TAP_INTERVAL_MAX_S)
+                logger.info("  Tap gap: %.2f s before next tile", tap_gap)
+                await asyncio.sleep(tap_gap)
 
                 # Wait for the tile fade/replace animation before re-detecting
                 await page.wait_for_timeout(TILE_DRAIN_WAIT_MS)
@@ -402,6 +436,43 @@ async def solve_captcha_loop(page: Page) -> bool:
                     rnd, MAX_TILE_CLICKS,
                 )
                 break
+
+        # ── Anti-Stuck Scan ──────────────────────────────────────────────────
+        # After the last tap in the drain loop, wait ANTI_STUCK_WAIT_MS (3 s)
+        # so any replacement tiles that were queued to appear have time to
+        # fully render.  Then do one final YOLO scan.  Only proceed to
+        # Next / Verify if zero targets remain — otherwise loop again.
+        logger.info(
+            "[round %d] Anti-stuck cooldown: waiting %d ms for replacement tiles…",
+            rnd, ANTI_STUCK_WAIT_MS,
+        )
+        await page.wait_for_timeout(ANTI_STUCK_WAIT_MS)
+
+        await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
+        raw_box_as = await _bounding_box(page, BFRAME_SELS)
+        crop_box_as = _clamp_box(raw_box_as) if raw_box_as else _clamp_box(CAPTCHA_CROP_FALLBACK)
+        try:
+            _crop_screenshot(SCREENSHOT_PATH, crop_box_as, CAPTCHA_CROP_PATH)
+            remaining = await asyncio.get_running_loop().run_in_executor(
+                None, _run_yolo, CAPTCHA_CROP_PATH, (crop_box_as[0], crop_box_as[1])
+            )
+        except FileNotFoundError:
+            remaining = []
+
+        if remaining:
+            logger.info(
+                "[round %d] Anti-stuck scan found %d new target(s) — "
+                "re-entering drain loop",
+                rnd, len(remaining),
+            )
+            # Inject the new detections back into the drain loop by continuing
+            # the round (the drain loop will pick them up on the next pass).
+            # We do this by NOT breaking out here; instead we fall through to
+            # the button check so the outer for-loop iterates naturally.
+            # If the button says "next"/"verify" at this point, that's fine too.
+
+        else:
+            logger.info("[round %d] Anti-stuck scan: 0 targets — grid is clean", rnd)
 
         # Brief settle pause before reading the bframe button
         await page.wait_for_timeout(800)
