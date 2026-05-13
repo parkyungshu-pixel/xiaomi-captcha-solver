@@ -50,20 +50,52 @@ CAPTCHA_CROP_PATH = "captcha_crop.png"
 
 # YOLOv8
 YOLO_MODEL_PATH           = "yolov8n.pt"
-# Lowered to 0.12 (Early Detection / Human Eye Logic): we want to detect tiles
-# while they are still fading in, before they are fully rendered.  The actual
-# click is delayed by the visual-processing cooldown below, so the click still
-# lands on a fully-visible tile.
-YOLO_CONFIDENCE_THRESHOLD = 0.12
+# Raised to 0.25: reduces "ghost" false-positives (blurry shadows that look
+# like a target class but aren't).  Strict captcha-instruction filtering below
+# compensates for the higher bar by removing off-class detections entirely.
+YOLO_CONFIDENCE_THRESHOLD = 0.25
+
+# All COCO classes that may ever appear in Xiaomi's reCAPTCHA challenges.
 TARGET_CLASSES = {
     "bus", "traffic light", "car", "truck",
     "bicycle", "motorcycle", "fire hydrant", "stop sign",
 }
 
+# Keyword → canonical COCO label mapping.
+# When the captcha instruction is read, only detections whose COCO label is in
+# the resolved set are clicked.  All other detections are silently ignored.
+INSTRUCTION_CLASS_MAP = {
+    "traffic light":  {"traffic light"},
+    "traffic lights": {"traffic light"},
+    "bus":            {"bus"},
+    "buses":          {"bus"},
+    "car":            {"car"},
+    "cars":           {"car"},
+    "truck":          {"truck"},
+    "trucks":         {"truck"},
+    "bicycle":        {"bicycle"},
+    "bicycles":       {"bicycle"},
+    "motorcycle":     {"motorcycle"},
+    "motorcycles":    {"motorcycle"},
+    "fire hydrant":   {"fire hydrant"},
+    "fire hydrants":  {"fire hydrant"},
+    "stop sign":      {"stop sign"},
+    "stop signs":     {"stop sign"},
+    # broader / catch-all variants
+    "vehicles":       {"car", "truck", "bus", "motorcycle"},
+    "crosswalk":      set(),   # not a COCO class; will click nothing (graceful)
+    "stairs":         set(),
+}
+
+# For these classes, use a compressed fast-path timing (0.3 s gap vs 0.4–0.8 s)
+# to submit Verify before the challenge times out.
+FAST_PATH_CLASSES = {"traffic light", "bus", "car", "truck", "stop sign"}
+
 # Solver loop
-MAX_CAPTCHA_ROUNDS  = 10    # give up after this many rounds
-HUMAN_JITTER_PX     = 5     # ±px random offset on every click
-ROUND_WAIT_MS       = 3000  # ms to wait for the grid to load each round
+MAX_CAPTCHA_ROUNDS      = 10   # give up after this many rounds
+HUMAN_JITTER_PX         = 5    # ±px random offset on every click
+ROUND_WAIT_MS           = 3000 # ms to wait for the grid to load each round
+IP_HEAT_WARNING_ROUND   = 5    # warn user to rest / change IP after this round
 
 # Human-like timing constants (kept tight to avoid challenge expiry)
 # Visual Processing Cooldown: short thinking pause before each tap.
@@ -73,6 +105,9 @@ VISUAL_COOLDOWN_MAX_S = 1.0
 # Dynamic Tap Interval: random pause BETWEEN consecutive tile taps.
 TAP_INTERVAL_MIN_S  = 0.4
 TAP_INTERVAL_MAX_S  = 0.8
+
+# Fast-path tap interval — used when the target class is in FAST_PATH_CLASSES.
+FAST_TAP_INTERVAL_S = 0.3
 
 # Anti-Stuck Scan: after the last tap, wait this long before final rescan.
 ANTI_STUCK_WAIT_MS  = 1000
@@ -147,8 +182,15 @@ def _crop_screenshot(
 def _run_yolo(
     crop_path: str,
     origin: Tuple[int, int],
+    filter_classes: Optional[set] = None,
 ) -> List[Tuple[str, float, float, float]]:
-    """Return list of (label, conf, viewport_cx, viewport_cy) sorted by conf desc."""
+    """Return list of (label, conf, viewport_cx, viewport_cy) sorted by conf desc.
+
+    If `filter_classes` is provided (and non-empty), only detections whose
+    label is in that set are returned.  If the set is empty (e.g. the captcha
+    instruction asked for a COCO-unknown class like "crosswalk") no detections
+    are returned so the solver moves on to Verify gracefully.
+    """
     model   = _load_yolo()
     results = model.predict(source=crop_path, conf=YOLO_CONFIDENCE_THRESHOLD, verbose=False)
     ox, oy  = origin
@@ -158,7 +200,11 @@ def _run_yolo(
             continue
         for box in result.boxes:
             label = result.names.get(int(box.cls[0]), "?")
-            if label not in TARGET_CLASSES:
+            # Apply strict class filter when one is provided
+            if filter_classes is not None:
+                if not filter_classes or label not in filter_classes:
+                    continue
+            elif label not in TARGET_CLASSES:
                 continue
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             hits.append((
@@ -169,6 +215,21 @@ def _run_yolo(
             ))
     hits.sort(key=lambda d: d[1], reverse=True)
     return hits
+
+def _resolve_filter_classes(instruction: str) -> Optional[set]:
+    """Map a captcha instruction string to the set of COCO labels to click.
+
+    Returns:
+      • A non-empty set   → click only those COCO labels
+      • An empty set      → instruction is a COCO-unknown class; click nothing
+      • None              → instruction not recognised; fall back to TARGET_CLASSES
+    """
+    low = instruction.lower()
+    for keyword, classes in INSTRUCTION_CLASS_MAP.items():
+        if keyword in low:
+            return classes
+    return None  # unknown — keep full TARGET_CLASSES as fallback
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # reCAPTCHA iframe helpers
@@ -255,7 +316,35 @@ async def _click_anchor_checkbox(page: Page) -> bool:
     return False
 
 
-async def _challenge_expired(page: Page) -> bool:
+async def _read_captcha_instruction(page: Page) -> str:
+    """Read the prompt text from the reCAPTCHA bframe challenge popup.
+
+    reCAPTCHA renders the instruction (e.g. "Select all images with traffic
+    lights") inside the bframe in `.rc-imageselect-desc-no-canonical` or
+    `.rc-imageselect-desc`.  We try both and return the cleaned text.
+
+    Returns empty string if nothing can be read.
+    """
+    for sel in BFRAME_SELS:
+        try:
+            if await page.locator(sel).count() == 0:
+                continue
+            frame = page.frame_locator(sel)
+            for desc_sel in (
+                ".rc-imageselect-desc-no-canonical",
+                ".rc-imageselect-desc",
+                "[class*='imageselect-desc']",
+            ):
+                el = frame.locator(desc_sel)
+                if await el.count() == 0:
+                    continue
+                txt = (await el.first.inner_text()).strip()
+                if txt:
+                    logger.info("Captcha instruction: %r", txt)
+                    return txt
+        except Exception:
+            pass
+    return ""
     """Check whether the reCAPTCHA challenge has expired.
 
     When the user takes too long, the bframe shows a message like
@@ -378,6 +467,33 @@ async def solve_captcha_loop(page: Page) -> bool:
         # Step 3 ── wait for tiles to fully load, then enter the drain loop ──
         await page.wait_for_timeout(ROUND_WAIT_MS)
 
+        # ── IP Heat Check ─────────────────────────────────────────────────────
+        if rnd >= IP_HEAT_WARNING_ROUND:
+            logger.warning(
+                "⚠ IP HEAT WARNING — round %d/%d reached. "
+                "Consider changing IP or pausing to avoid permanent blocks.",
+                rnd, MAX_CAPTCHA_ROUNDS,
+            )
+
+        # ── Read captcha instruction for strict class filtering ────────────────
+        instruction   = await _read_captcha_instruction(page)
+        filter_cls    = _resolve_filter_classes(instruction)
+        active_labels = filter_cls if filter_cls is not None else TARGET_CLASSES
+
+        if filter_cls is not None:
+            logger.info(
+                "[round %d] Strict filter active: instruction=%r → classes=%s",
+                rnd, instruction, sorted(active_labels),
+            )
+        else:
+            logger.info(
+                "[round %d] No instruction match — using full TARGET_CLASSES",
+                rnd,
+            )
+
+        # Is this a fast-path round (e.g. "traffic lights" → click quickly)?
+        is_fast = bool(active_labels & FAST_PATH_CLASSES)
+
         # (initial screenshot/crop is taken inside the tile-drain loop below)
 
         # Step 4 ── Tile-drain inner loop ────────────────────────────────────
@@ -405,11 +521,13 @@ async def solve_captcha_loop(page: Page) -> bool:
                 break
 
             detections = await event_loop.run_in_executor(
-                None, _run_yolo, CAPTCHA_CROP_PATH, (crop_box_d[0], crop_box_d[1])
+                None, _run_yolo, CAPTCHA_CROP_PATH, (crop_box_d[0], crop_box_d[1]),
+                filter_cls,
             )
 
-            logger.info("[round %d / drain %d] YOLO found %d target(s)",
-                        rnd, drain_pass, len(detections))
+            logger.info("[round %d / drain %d] YOLO found %d target(s) (filter=%s)",
+                        rnd, drain_pass, len(detections),
+                        sorted(active_labels) if active_labels else "[]")
 
             if not detections:
                 logger.info("[round %d] Grid fully drained — proceeding to button", rnd)
@@ -453,9 +571,14 @@ async def solve_captcha_loop(page: Page) -> bool:
                 clicked_any = True
 
                 # ── Dynamic Tap Interval ──────────────────────────────────────
-                # Random pause between consecutive tile taps (not machine-gun).
-                tap_gap = random.uniform(TAP_INTERVAL_MIN_S, TAP_INTERVAL_MAX_S)
-                logger.info("  Tap gap: %.2f s before next tile", tap_gap)
+                # Fast-path: known easy classes get a shorter gap to avoid
+                # the challenge expiry window; all others use the normal range.
+                if is_fast:
+                    tap_gap = FAST_TAP_INTERVAL_S
+                    logger.info("  Fast-path tap gap: %.2f s", tap_gap)
+                else:
+                    tap_gap = random.uniform(TAP_INTERVAL_MIN_S, TAP_INTERVAL_MAX_S)
+                    logger.info("  Tap gap: %.2f s before next tile", tap_gap)
                 await asyncio.sleep(tap_gap)
 
                 # Wait for the tile fade/replace animation before re-detecting
@@ -481,7 +604,8 @@ async def solve_captcha_loop(page: Page) -> bool:
         try:
             _crop_screenshot(SCREENSHOT_PATH, crop_box_as, CAPTCHA_CROP_PATH)
             remaining = await asyncio.get_running_loop().run_in_executor(
-                None, _run_yolo, CAPTCHA_CROP_PATH, (crop_box_as[0], crop_box_as[1])
+                None, _run_yolo, CAPTCHA_CROP_PATH, (crop_box_as[0], crop_box_as[1]),
+                filter_cls,
             )
         except FileNotFoundError:
             remaining = []
