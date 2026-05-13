@@ -276,8 +276,11 @@ async def run(headless: bool = False) -> None:
 
 
 def main() -> None:
+    # headless=True so this also works in environments without a display
+    # server (e.g. GitHub Codespaces, CI). Flip to False locally if you want
+    # to watch the browser and keep the window open via the Ctrl+C loop.
     try:
-        asyncio.run(run(headless=False))
+        asyncio.run(run(headless=True))
     except KeyboardInterrupt:
         logger.info("Interrupted by user.")
 
