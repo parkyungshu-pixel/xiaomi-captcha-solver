@@ -5,13 +5,16 @@ This script launches a Chromium browser patched against common bot-detection
 signals (navigator.webdriver, missing plugins, HeadlessChrome UA, etc.) via
 the `playwright-stealth` package, then navigates to the Xiaomi login page.
 
-The captcha slot is left as a placeholder (see `solve_captcha`) so the AI
-image solver can be plugged in later without touching the browser setup.
+The captcha is solved by running YOLOv8 object detection against a crop of
+the pre-captcha screenshot (`check.png`) and clicking the center of every
+target object in viewport coordinates.
 """
 
 import asyncio
 import logging
-from typing import Optional
+from functools import lru_cache
+from pathlib import Path
+from typing import List, Optional, Tuple
 
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright_stealth import Stealth
@@ -37,6 +40,42 @@ TIMEZONE_ID = "Asia/Manila"
 # useful for debugging selectors and verifying the page rendered correctly.
 SCREENSHOT_PATH = "check.png"
 
+# ---- Captcha / YOLO config --------------------------------------------------
+
+# Pixel region of `check.png` that contains the object-selection captcha.
+# Tune this once after inspecting check.png for the first time. The box is
+# (left, top, right, bottom) in the screenshot's coordinate space.
+# NOTE: page.mouse.click() uses viewport-relative coordinates. Since check.png
+# is captured with full_page=True, this crop must lie within the initial
+# viewport (no scroll offset) for the click coordinates to line up correctly.
+CAPTCHA_CROP_BOX: Tuple[int, int, int, int] = (400, 180, 1000, 620)
+
+# Where to write the cropped captcha for YOLO inference / debugging.
+CAPTCHA_CROP_PATH = "captcha_crop.png"
+
+# YOLOv8 weights. `yolov8n.pt` (nano) is downloaded on first use by
+# ultralytics and is fast enough for a single captcha frame.
+YOLO_MODEL_PATH = "yolov8n.pt"
+
+# COCO classes we care about for Xiaomi's object-selection captcha. Extend or
+# shrink this set based on the prompt text on the actual captcha.
+TARGET_CLASSES = {
+    "bus",
+    "traffic light",
+    "car",
+    "truck",
+    "bicycle",
+    "motorcycle",
+    "fire hydrant",
+    "stop sign",
+}
+
+# Minimum confidence for a detection to be clicked.
+YOLO_CONFIDENCE_THRESHOLD = 0.35
+
+# Small delay between clicks so the interaction looks more human.
+CLICK_DELAY_SECONDS = 0.4
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -44,21 +83,127 @@ logging.basicConfig(
 logger = logging.getLogger("xiaomi-login")
 
 
-async def solve_captcha(page: Page) -> bool:
-    """
-    Placeholder for the AI-based captcha solver.
+@lru_cache(maxsize=1)
+def _load_yolo_model():
+    """Load and cache the YOLOv8 model. Imported lazily so the browser-only
+    code path does not pay the torch import cost."""
+    from ultralytics import YOLO  # heavy import, keep it lazy
 
-    TODO: Integrate the AI image solver here.
-      1. Detect whether a captcha widget appeared on `page`
-         (e.g. iframe or canvas with a known selector).
-      2. Capture the challenge image (page.locator(...).screenshot()).
-      3. Send it to the AI solver (local model or hosted API) and
-         receive the target coordinates / slider offset / text.
-      4. Replay the solution using page.mouse / page.keyboard so the
-         interaction looks human (bezier path, jitter, small pauses).
-      5. Return True on success, False otherwise so the caller can retry.
+    logger.info("Loading YOLO model from %s ...", YOLO_MODEL_PATH)
+    return YOLO(YOLO_MODEL_PATH)
+
+
+def _crop_captcha(
+    screenshot_path: str, crop_box: Tuple[int, int, int, int], out_path: str
+) -> str:
+    """Crop the captcha region out of the pre-captcha screenshot and save
+    it so YOLO can run inference on just the relevant pixels."""
+    from PIL import Image  # lazy import
+
+    if not Path(screenshot_path).exists():
+        raise FileNotFoundError(
+            f"Pre-captcha screenshot not found: {screenshot_path}. "
+            "Make sure run() captured it before calling solve_captcha()."
+        )
+
+    with Image.open(screenshot_path) as img:
+        crop = img.crop(crop_box)
+        crop.save(out_path)
+    logger.info("Cropped captcha region %s -> %s", crop_box, out_path)
+    return out_path
+
+
+def _detect_targets(
+    crop_path: str,
+    crop_origin: Tuple[int, int],
+) -> List[Tuple[str, float, float, float]]:
+    """Run YOLOv8 on the cropped image and return a list of
+    (label, confidence, viewport_cx, viewport_cy) tuples for every detection
+    whose class is in TARGET_CLASSES.
+
+    The crop's (0, 0) corresponds to `crop_origin` in the original
+    screenshot / viewport, so we translate each center back to viewport
+    coordinates before returning.
     """
-    logger.info("Captcha solver not wired up yet - skipping.")
+    model = _load_yolo_model()
+    results = model.predict(
+        source=crop_path,
+        conf=YOLO_CONFIDENCE_THRESHOLD,
+        verbose=False,
+    )
+
+    ox, oy = crop_origin
+    detections: List[Tuple[str, float, float, float]] = []
+
+    for result in results:
+        names = result.names  # {class_id: class_name}
+        if result.boxes is None:
+            continue
+        for box in result.boxes:
+            cls_idx = int(box.cls[0])
+            label = names.get(cls_idx, str(cls_idx))
+            if label not in TARGET_CLASSES:
+                continue
+            conf = float(box.conf[0])
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            cx_crop = (x1 + x2) / 2.0
+            cy_crop = (y1 + y2) / 2.0
+            detections.append((label, conf, cx_crop + ox, cy_crop + oy))
+
+    # Sort by confidence (highest first) so if the captcha expects N clicks
+    # in order, the strongest predictions go first.
+    detections.sort(key=lambda d: d[1], reverse=True)
+    return detections
+
+
+async def solve_captcha(page: Page) -> bool:
+    """Solve Xiaomi's object-selection captcha using YOLOv8.
+
+    Pipeline:
+      1. Crop the captcha region out of `check.png`.
+      2. Run YOLOv8 on the crop to detect objects (bus, traffic light, ...).
+      3. Translate each detection's center back to viewport coordinates.
+      4. Click every center via `page.mouse.click()` with a small delay.
+
+    Returns True when at least one target was detected and clicked.
+    """
+    try:
+        crop_path = _crop_captcha(
+            SCREENSHOT_PATH, CAPTCHA_CROP_BOX, CAPTCHA_CROP_PATH
+        )
+    except FileNotFoundError as exc:
+        logger.error("%s", exc)
+        return False
+
+    # Inference is CPU/GPU bound and synchronous - run it off the event loop.
+    loop = asyncio.get_running_loop()
+    crop_origin = (CAPTCHA_CROP_BOX[0], CAPTCHA_CROP_BOX[1])
+    detections = await loop.run_in_executor(
+        None, _detect_targets, crop_path, crop_origin
+    )
+
+    if not detections:
+        logger.warning(
+            "No target objects detected in captcha crop (classes=%s, conf>=%.2f).",
+            sorted(TARGET_CLASSES),
+            YOLO_CONFIDENCE_THRESHOLD,
+        )
+        return False
+
+    logger.info("YOLO detected %d target object(s):", len(detections))
+    for label, conf, cx, cy in detections:
+        logger.info("  - %-15s conf=%.2f  center=(%.1f, %.1f)", label, conf, cx, cy)
+
+    # Click each detection center. page.mouse.click() takes viewport-relative
+    # coordinates, which is why _detect_targets translated the crop-local
+    # centers back using CAPTCHA_CROP_BOX's origin.
+    for label, _conf, cx, cy in detections:
+        logger.info("Clicking '%s' at (%.1f, %.1f)", label, cx, cy)
+        await page.mouse.click(cx, cy)
+        await asyncio.sleep(CLICK_DELAY_SECONDS)
+
+    # TODO: after clicking, locate and press the captcha's submit/confirm
+    # button, then verify success (e.g. wait for navigation or error toast).
     return True
 
 

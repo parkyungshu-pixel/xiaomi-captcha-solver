@@ -1,2 +1,4 @@
 playwright>=1.44.0
 playwright-stealth>=2.0.0
+ultralytics>=8.1.0
+Pillow>=10.0.0
