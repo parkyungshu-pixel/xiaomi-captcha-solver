@@ -300,6 +300,133 @@ async def launch_stealth_context(
     return browser, context
 
 
+async def _trigger_registration_form(page: Page) -> bool:
+    """Navigate through the Xiaomi login page to force the reCAPTCHA to appear.
+
+    Flow:
+      1. Click the 'Create account' / 'Sign up' link on the login page.
+      2. Wait for the registration form to load.
+      3. Fill in a dummy email and password.
+      4. Click 'Next' / 'Continue' to submit the first step and trigger
+         the reCAPTCHA challenge.
+
+    Returns True if every step succeeded, False if any selector was not found
+    (caller should still proceed and let the iframe dump reveal what's on page).
+    """
+    # -- Step 1: click "Create account" / "Sign up" ---------------------------
+    # Xiaomi's login page renders multiple localisation variants; try them all.
+    signup_selectors = [
+        "text=Create account",
+        "text=Sign up",
+        "text=Register",
+        "text=注册",                          # Chinese fallback
+        "a[href*='register']",
+        "a[href*='signup']",
+        "button:has-text('Create account')",
+        "button:has-text('Sign up')",
+        "[data-testid='signup']",
+    ]
+    clicked_signup = False
+    for sel in signup_selectors:
+        try:
+            locator = page.locator(sel).first
+            if await locator.count() == 0:
+                continue
+            await locator.click(timeout=3000)
+            clicked_signup = True
+            logger.info("Clicked signup trigger using selector: %s", sel)
+            break
+        except Exception:
+            continue
+
+    if not clicked_signup:
+        logger.warning(
+            "Could not find 'Create account' button — proceeding anyway; "
+            "the registration form may already be visible."
+        )
+
+    # Wait for the registration fields to appear.
+    await page.wait_for_timeout(2000)
+
+    # -- Step 2: fill dummy email ---------------------------------------------
+    email_selectors = [
+        "input[type='email']",
+        "input[name='email']",
+        "input[placeholder*='email' i]",
+        "input[placeholder*='mail' i]",
+        "input[id*='email' i]",
+    ]
+    filled_email = False
+    for sel in email_selectors:
+        try:
+            locator = page.locator(sel).first
+            if await locator.count() == 0:
+                continue
+            await locator.fill("testuser_debug@example.com", timeout=3000)
+            filled_email = True
+            logger.info("Filled email field using selector: %s", sel)
+            break
+        except Exception:
+            continue
+
+    if not filled_email:
+        logger.warning("Could not find email input field.")
+
+    # -- Step 3: fill dummy password ------------------------------------------
+    password_selectors = [
+        "input[type='password']",
+        "input[name='password']",
+        "input[placeholder*='password' i]",
+        "input[id*='password' i]",
+    ]
+    filled_password = False
+    for sel in password_selectors:
+        try:
+            locator = page.locator(sel).first
+            if await locator.count() == 0:
+                continue
+            await locator.fill("DebugPass123!", timeout=3000)
+            filled_password = True
+            logger.info("Filled password field using selector: %s", sel)
+            break
+        except Exception:
+            continue
+
+    if not filled_password:
+        logger.warning("Could not find password input field.")
+
+    # -- Step 4: click "Next" / "Continue" to trigger reCAPTCHA ---------------
+    next_selectors = [
+        "button:has-text('Next')",
+        "button:has-text('Continue')",
+        "button:has-text('Sign up')",
+        "button:has-text('Register')",
+        "button[type='submit']",
+        "input[type='submit']",
+        "text=Next",
+        "text=Continue",
+    ]
+    clicked_next = False
+    for sel in next_selectors:
+        try:
+            locator = page.locator(sel).first
+            if await locator.count() == 0:
+                continue
+            await locator.click(timeout=3000)
+            clicked_next = True
+            logger.info("Clicked next/submit using selector: %s", sel)
+            break
+        except Exception:
+            continue
+
+    if not clicked_next:
+        logger.warning(
+            "Could not find Next/Submit button — reCAPTCHA may not appear."
+        )
+
+    return clicked_signup or filled_email or clicked_next
+
+
 async def run(headless: bool = False) -> None:
     async with async_playwright() as playwright:
         browser, context = await launch_stealth_context(playwright, headless=headless)
@@ -314,19 +441,26 @@ async def run(headless: bool = False) -> None:
             await page.wait_for_load_state("networkidle")
             logger.info("Landed on: %s", page.url)
 
-            # Extra wait so the reCAPTCHA tile images (the 3x3 / 4x4 grid)
-            # finish loading. networkidle alone is not enough because tiles
-            # are lazily requested after the iframe renders.
+            # Walk through the registration form to force the reCAPTCHA to
+            # render. Without filling & submitting the form, the captcha iframe
+            # never appears in the DOM.
+            logger.info("Triggering registration form to force reCAPTCHA...")
+            await _trigger_registration_form(page)
+
+            # Now wait 10 s for the reCAPTCHA tile images to finish loading.
+            # This wait is placed *after* the form submission so we're giving
+            # time to the challenge that was just triggered, not the blank page.
             logger.info("Waiting 10s for reCAPTCHA tiles to finish loading...")
             await page.wait_for_timeout(10000)
 
-            # Scroll to the bottom of the page to trigger any lazy-loaded
-            # captcha widgets that only render when scrolled into view.
+            # Scroll to bottom so any lazy-rendered widget comes into view.
             logger.info("Scrolling to bottom of page...")
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
 
-            # ---- DEBUG: dump all <iframe> tags from page.content() ----
+            # ---- DEBUG: dump all <iframe> tags from page.content() ----------
+            # This tells us exactly which captcha provider Xiaomi is using and
+            # what CSS selectors / src patterns are available.
             html_content = await page.content()
             iframe_tags = re.findall(r"<iframe[^>]*>", html_content, re.IGNORECASE)
             logger.info("=== RAW HTML iframe tags found: %d ===", len(iframe_tags))
@@ -336,19 +470,12 @@ async def run(headless: bool = False) -> None:
                 logger.info("  (no <iframe> tags in page source)")
             logger.info("=== END iframe dump ===")
 
-            # Capture a full-page screenshot after load but before the captcha
-            # is triggered - handy for inspecting layout and confirming that
-            # stealth patches kept the page from redirecting to a block page.
+            # Full-page screenshot so we can see exactly what the browser sees
+            # after the registration step — captcha should be visible here.
             await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
-            logger.info("Saved pre-captcha screenshot to %s", SCREENSHOT_PATH)
+            logger.info("Saved screenshot to %s", SCREENSHOT_PATH)
 
-            # TODO: fill in credentials
-            #   await page.fill("input[name='account']", USERNAME)
-            #   await page.fill("input[name='password']", PASSWORD)
-            #   await page.click("button#login-button")
-
-            # TODO: after clicking login, the captcha modal may appear.
-            # Hand it off to the AI solver:
+            # Hand off to the YOLO captcha solver.
             await solve_captcha(page)
 
             # Keep the window open for manual inspection when running headed.
