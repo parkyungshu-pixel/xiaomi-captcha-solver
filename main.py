@@ -33,6 +33,10 @@ VIEWPORT = {"width": 1366, "height": 768}
 LOCALE = "en-US"
 TIMEZONE_ID = "Asia/Manila"
 
+# Path for the post-load screenshot (captured before the captcha appears),
+# useful for debugging selectors and verifying the page rendered correctly.
+SCREENSHOT_PATH = "check.png"
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -99,6 +103,12 @@ async def run(headless: bool = False) -> None:
             # Give the SPA a moment to hydrate form fields / anti-bot scripts.
             await page.wait_for_load_state("networkidle")
             logger.info("Landed on: %s", page.url)
+
+            # Capture a full-page screenshot after load but before the captcha
+            # is triggered - handy for inspecting layout and confirming that
+            # stealth patches kept the page from redirecting to a block page.
+            await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
+            logger.info("Saved pre-captcha screenshot to %s", SCREENSHOT_PATH)
 
             # TODO: fill in credentials
             #   await page.fill("input[name='account']", USERNAME)
