@@ -1,13 +1,15 @@
 """
-Xiaomi login flow automation using Playwright with stealth mode.
+Xiaomi registration flow automation using Playwright with stealth mode.
 
-This script launches a Chromium browser patched against common bot-detection
-signals (navigator.webdriver, missing plugins, HeadlessChrome UA, etc.) via
-the `playwright-stealth` package, then navigates to the Xiaomi login page.
-
-The captcha is solved by running YOLOv8 object detection against a crop of
-the pre-captcha screenshot (`check.png`) and clicking the center of every
-target object in viewport coordinates.
+Flow:
+  1. Open Xiaomi login page in mobile viewport (1080x1920, Android Chrome UA).
+  2. Click the "Sign up" tab.
+  3. Fill Email, New password, Confirm new password.
+  4. Tick the "I've read and agreed..." checkbox — required to enable Next.
+  5. Click the orange "Next" button.
+  6. Wait 10 s for the captcha to fully render.
+  7. Auto-detect the captcha iframe, crop it from the screenshot, run YOLOv8.
+  8. Click the detected object centers via page.mouse.click().
 """
 
 import asyncio
@@ -20,110 +22,88 @@ from typing import List, Optional, Tuple
 from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 from playwright_stealth import Stealth
 
-# Xiaomi account login endpoint. `sid=passport` returns the generic landing
-# page; change this if you need to log into a specific Xiaomi service.
+# ---------------------------------------------------------------------------
+# URLs
+# ---------------------------------------------------------------------------
 XIAOMI_LOGIN_URL = "https://account.xiaomi.com/pass/serviceLogin?sid=passport"
 
-# Realistic desktop user agent. Stealth will still override several fingerprint
-# fields, but pinning the UA avoids the default Playwright `HeadlessChrome`
-# marker that triggers instant blocks.
+# ---------------------------------------------------------------------------
+# Browser / viewport config
+# Mobile viewport to match the Android Desktop-Site view in the screenshot.
+# page.mouse.click() coords must match the viewport, NOT the screenshot pixels
+# when full_page=True captures content beyond the fold.
+# ---------------------------------------------------------------------------
 USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "Mozilla/5.0 (Linux; Android 13; Pixel 7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
+    "Chrome/125.0.0.0 Mobile Safari/537.36"
 )
-
-VIEWPORT = {"width": 1366, "height": 768}
+VIEWPORT = {"width": 1080, "height": 1920}
 LOCALE = "en-US"
 TIMEZONE_ID = "Asia/Manila"
 
-# Path for the post-load screenshot (captured before the captcha appears),
-# useful for debugging selectors and verifying the page rendered correctly.
-SCREENSHOT_PATH = "check.png"
+# ---------------------------------------------------------------------------
+# Screenshot / debug paths
+# ---------------------------------------------------------------------------
+SCREENSHOT_PATH   = "check.png"        # full-page after captcha triggered
+DEBUG_FORM_PATH   = "debug_form.png"   # after fields are filled, before Next
 
-# ---- Captcha / YOLO config --------------------------------------------------
-
-# CSS selector used to locate the reCAPTCHA image-challenge iframe. Its
-# bounding box is preferred over the hardcoded CAPTCHA_CROP_BOX fallback
-# because reCAPTCHA renders the challenge at slightly different coords
-# depending on viewport / prompt length.
+# ---------------------------------------------------------------------------
+# Captcha / YOLO config
+# ---------------------------------------------------------------------------
+# Ordered list of CSS selectors tried to locate the reCAPTCHA bframe iframe.
 RECAPTCHA_CHALLENGE_SELECTORS = (
     'iframe[src*="recaptcha/api2/bframe"]',
     'iframe[src*="recaptcha/enterprise/bframe"]',
     'iframe[title*="recaptcha challenge"]',
 )
 
-# Fallback pixel region of `check.png` that contains the object-selection
-# captcha, used only if the iframe bounding box above cannot be resolved.
-# The box is (left, top, right, bottom) in the screenshot's coordinate space.
-# NOTE: page.mouse.click() uses viewport-relative coordinates. Since check.png
-# is captured with full_page=True, this crop must lie within the initial
-# viewport (no scroll offset) for the click coordinates to line up correctly.
-# A typical reCAPTCHA v2 image challenge is roughly 400x580 px.
-CAPTCHA_CROP_BOX: Tuple[int, int, int, int] = (0, 0, 1000, 1000)
+# Fallback crop used when the iframe bounding-box lookup fails.
+# (left, top, right, bottom) in screenshot coordinates.
+CAPTCHA_CROP_BOX: Tuple[int, int, int, int] = (0, 0, 1080, 1920)
 
-# Where to write the cropped captcha for YOLO inference / debugging.
 CAPTCHA_CROP_PATH = "captcha_crop.png"
+YOLO_MODEL_PATH   = "yolov8n.pt"
 
-# YOLOv8 weights. `yolov8n.pt` (nano) is downloaded on first use by
-# ultralytics and is fast enough for a single captcha frame.
-YOLO_MODEL_PATH = "yolov8n.pt"
-
-# COCO classes we care about for Xiaomi's object-selection captcha. Extend or
-# shrink this set based on the prompt text on the actual captcha.
 TARGET_CLASSES = {
-    "bus",
-    "traffic light",
-    "car",
-    "truck",
-    "bicycle",
-    "motorcycle",
-    "fire hydrant",
-    "stop sign",
+    "bus", "traffic light", "car", "truck",
+    "bicycle", "motorcycle", "fire hydrant", "stop sign",
 }
 
-# Minimum confidence for a detection to be clicked. Kept low (0.20) because
-# reCAPTCHA tiles are small crops of real objects and YOLO often returns
-# modest confidences on them.
 YOLO_CONFIDENCE_THRESHOLD = 0.20
+CLICK_DELAY_SECONDS       = 0.4
 
-# Small delay between clicks so the interaction looks more human.
-CLICK_DELAY_SECONDS = 0.4
-
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("xiaomi-login")
+logger = logging.getLogger("xiaomi-captcha")
 
 
+# ---------------------------------------------------------------------------
+# YOLO helpers
+# ---------------------------------------------------------------------------
 @lru_cache(maxsize=1)
 def _load_yolo_model():
-    """Load and cache the YOLOv8 model. Imported lazily so the browser-only
-    code path does not pay the torch import cost."""
-    from ultralytics import YOLO  # heavy import, keep it lazy
-
-    logger.info("Loading YOLO model from %s ...", YOLO_MODEL_PATH)
+    from ultralytics import YOLO
+    logger.info("Loading YOLO model: %s", YOLO_MODEL_PATH)
     return YOLO(YOLO_MODEL_PATH)
 
 
 def _crop_captcha(
-    screenshot_path: str, crop_box: Tuple[int, int, int, int], out_path: str
+    screenshot_path: str,
+    crop_box: Tuple[int, int, int, int],
+    out_path: str,
 ) -> str:
-    """Crop the captcha region out of the pre-captcha screenshot and save
-    it so YOLO can run inference on just the relevant pixels."""
-    from PIL import Image  # lazy import
-
+    from PIL import Image
     if not Path(screenshot_path).exists():
-        raise FileNotFoundError(
-            f"Pre-captcha screenshot not found: {screenshot_path}. "
-            "Make sure run() captured it before calling solve_captcha()."
-        )
-
+        raise FileNotFoundError(f"Screenshot not found: {screenshot_path}")
     with Image.open(screenshot_path) as img:
-        crop = img.crop(crop_box)
-        crop.save(out_path)
-    logger.info("Cropped captcha region %s -> %s", crop_box, out_path)
+        img.crop(crop_box).save(out_path)
+    logger.info("Saved captcha crop %s → %s", crop_box, out_path)
     return out_path
 
 
@@ -131,151 +111,89 @@ def _detect_targets(
     crop_path: str,
     crop_origin: Tuple[int, int],
 ) -> List[Tuple[str, float, float, float]]:
-    """Run YOLOv8 on the cropped image and return a list of
-    (label, confidence, viewport_cx, viewport_cy) tuples for every detection
-    whose class is in TARGET_CLASSES.
-
-    The crop's (0, 0) corresponds to `crop_origin` in the original
-    screenshot / viewport, so we translate each center back to viewport
-    coordinates before returning.
-    """
-    model = _load_yolo_model()
-    results = model.predict(
-        source=crop_path,
-        conf=YOLO_CONFIDENCE_THRESHOLD,
-        verbose=False,
-    )
-
-    ox, oy = crop_origin
-    detections: List[Tuple[str, float, float, float]] = []
-
+    model   = _load_yolo_model()
+    results = model.predict(source=crop_path, conf=YOLO_CONFIDENCE_THRESHOLD, verbose=False)
+    ox, oy  = crop_origin
+    hits: List[Tuple[str, float, float, float]] = []
     for result in results:
-        names = result.names  # {class_id: class_name}
         if result.boxes is None:
             continue
         for box in result.boxes:
-            cls_idx = int(box.cls[0])
-            label = names.get(cls_idx, str(cls_idx))
+            label = result.names.get(int(box.cls[0]), "?")
             if label not in TARGET_CLASSES:
                 continue
-            conf = float(box.conf[0])
             x1, y1, x2, y2 = box.xyxy[0].tolist()
-            cx_crop = (x1 + x2) / 2.0
-            cy_crop = (y1 + y2) / 2.0
-            detections.append((label, conf, cx_crop + ox, cy_crop + oy))
-
-    # Sort by confidence (highest first) so if the captcha expects N clicks
-    # in order, the strongest predictions go first.
-    detections.sort(key=lambda d: d[1], reverse=True)
-    return detections
+            hits.append((label, float(box.conf[0]),
+                          (x1 + x2) / 2 + ox,
+                          (y1 + y2) / 2 + oy))
+    hits.sort(key=lambda d: d[1], reverse=True)
+    return hits
 
 
-async def _locate_recaptcha_box(
-    page: Page,
-) -> Optional[Tuple[int, int, int, int]]:
-    """Try to resolve the reCAPTCHA challenge iframe's bounding box and
-    return it as (left, top, right, bottom) in viewport coordinates.
-
-    Returns None if no matching iframe is visible - callers should fall
-    back to the hardcoded CAPTCHA_CROP_BOX in that case.
-    """
-    for selector in RECAPTCHA_CHALLENGE_SELECTORS:
-        locator = page.locator(selector)
+# ---------------------------------------------------------------------------
+# reCAPTCHA iframe locator
+# ---------------------------------------------------------------------------
+async def _locate_recaptcha_box(page: Page) -> Optional[Tuple[int, int, int, int]]:
+    for sel in RECAPTCHA_CHALLENGE_SELECTORS:
+        loc = page.locator(sel)
         try:
-            count = await locator.count()
+            if await loc.count() == 0:
+                continue
+            box = await loc.first.bounding_box()
         except Exception:
             continue
-        if count == 0:
-            continue
-        try:
-            box = await locator.first.bounding_box()
-        except Exception:
-            box = None
         if not box:
             continue
-        left = int(box["x"])
-        top = int(box["y"])
-        right = int(box["x"] + box["width"])
-        bottom = int(box["y"] + box["height"])
-        logger.info(
-            "Resolved reCAPTCHA challenge via %s -> (%d, %d, %d, %d)",
-            selector,
-            left,
-            top,
-            right,
-            bottom,
-        )
+        left, top = int(box["x"]), int(box["y"])
+        right, bottom = left + int(box["width"]), top + int(box["height"])
+        logger.info("reCAPTCHA iframe found via %s → (%d,%d,%d,%d)",
+                    sel, left, top, right, bottom)
         return (left, top, right, bottom)
-
     return None
 
 
+# ---------------------------------------------------------------------------
+# YOLO captcha solver
+# ---------------------------------------------------------------------------
 async def solve_captcha(page: Page) -> bool:
-    """Solve Xiaomi's object-selection captcha using YOLOv8.
-
-    Pipeline:
-      1. Crop the captcha region out of `check.png`.
-      2. Run YOLOv8 on the crop to detect objects (bus, traffic light, ...).
-      3. Translate each detection's center back to viewport coordinates.
-      4. Click every center via `page.mouse.click()` with a small delay.
-
-    Returns True when at least one target was detected and clicked.
-    """
-    # Prefer the live iframe bounding box over CAPTCHA_CROP_BOX - this way
-    # we stay aligned even if reCAPTCHA shifts the challenge around.
     crop_box = await _locate_recaptcha_box(page)
     if crop_box is None:
-        logger.warning(
-            "reCAPTCHA iframe not found; falling back to hardcoded "
-            "CAPTCHA_CROP_BOX=%s.",
-            CAPTCHA_CROP_BOX,
-        )
+        logger.warning("reCAPTCHA iframe not found — using fallback crop %s", CAPTCHA_CROP_BOX)
         crop_box = CAPTCHA_CROP_BOX
 
     try:
-        crop_path = _crop_captcha(
-            SCREENSHOT_PATH, crop_box, CAPTCHA_CROP_PATH
-        )
+        crop_path = _crop_captcha(SCREENSHOT_PATH, crop_box, CAPTCHA_CROP_PATH)
     except FileNotFoundError as exc:
-        logger.error("%s", exc)
+        logger.error(exc)
         return False
 
-    # Inference is CPU/GPU bound and synchronous - run it off the event loop.
-    loop = asyncio.get_running_loop()
-    crop_origin = (crop_box[0], crop_box[1])
+    loop       = asyncio.get_running_loop()
     detections = await loop.run_in_executor(
-        None, _detect_targets, crop_path, crop_origin
+        None, _detect_targets, crop_path, (crop_box[0], crop_box[1])
     )
 
     if not detections:
-        logger.warning(
-            "No target objects detected in captcha crop (classes=%s, conf>=%.2f).",
-            sorted(TARGET_CLASSES),
-            YOLO_CONFIDENCE_THRESHOLD,
-        )
+        logger.warning("No targets detected (classes=%s, conf≥%.2f)",
+                       sorted(TARGET_CLASSES), YOLO_CONFIDENCE_THRESHOLD)
         return False
 
-    logger.info("YOLO detected %d target object(s):", len(detections))
+    logger.info("YOLO found %d target(s):", len(detections))
     for label, conf, cx, cy in detections:
-        logger.info("  - %-15s conf=%.2f  center=(%.1f, %.1f)", label, conf, cx, cy)
+        logger.info("  %-15s conf=%.2f  center=(%.1f, %.1f)", label, conf, cx, cy)
 
-    # Click each detection center. page.mouse.click() takes viewport-relative
-    # coordinates, which is why _detect_targets translated the crop-local
-    # centers back using CAPTCHA_CROP_BOX's origin.
-    for label, _conf, cx, cy in detections:
+    for label, _, cx, cy in detections:
         logger.info("Clicking '%s' at (%.1f, %.1f)", label, cx, cy)
         await page.mouse.click(cx, cy)
         await asyncio.sleep(CLICK_DELAY_SECONDS)
 
-    # TODO: after clicking, locate and press the captcha's submit/confirm
-    # button, then verify success (e.g. wait for navigation or error toast).
+    # TODO: click the captcha's Verify/Submit button and confirm success.
     return True
 
 
-async def launch_stealth_context(
-    playwright, headless: bool = False
-) -> tuple[Browser, BrowserContext]:
-    """Launch Chromium and build a stealth-enabled browser context."""
+# ---------------------------------------------------------------------------
+# Browser context factory
+# ---------------------------------------------------------------------------
+async def launch_stealth_context(playwright, headless: bool = True):
     browser = await playwright.chromium.launch(
         headless=headless,
         args=[
@@ -284,276 +202,290 @@ async def launch_stealth_context(
             "--disable-dev-shm-usage",
         ],
     )
-
     context = await browser.new_context(
         user_agent=USER_AGENT,
         viewport=VIEWPORT,
         locale=LOCALE,
         timezone_id=TIMEZONE_ID,
+        # Tell sites this is a mobile device so they serve the mobile layout.
+        is_mobile=True,
+        has_touch=True,
     )
-
-    # Apply stealth patches (navigator.webdriver, chrome runtime, WebGL
-    # vendor, permissions query, plugins array, etc.) to every page opened
-    # in this context.
     await Stealth().apply_stealth_async(context)
-
     return browser, context
 
 
-async def _trigger_registration_form(page: Page) -> bool:
-    """Navigate through the Xiaomi login page to force the reCAPTCHA to appear.
-
-    Flow:
-      1. Click the 'Create account' / 'Sign up' link on the login page.
-      2. Wait for the registration form to load.
-      3. Fill in a dummy email and password.
-      4. Click 'Next' / 'Continue' to submit the first step and trigger
-         the reCAPTCHA challenge.
-
-    Returns True if every step succeeded, False if any selector was not found
-    (caller should still proceed and let the iframe dump reveal what's on page).
-    """
-    # -- Step 1: click "Create account" / "Sign up" ---------------------------
-    # Xiaomi's login page renders multiple localisation variants; try them all.
-    signup_selectors = [
-        "text=Create account",
-        "text=Sign up",
-        "text=Register",
-        "text=注册",                          # Chinese fallback
-        "a[href*='register']",
-        "a[href*='signup']",
-        "button:has-text('Create account')",
-        "button:has-text('Sign up')",
-        "[data-testid='signup']",
-    ]
-    clicked_signup = False
-    for sel in signup_selectors:
+# ---------------------------------------------------------------------------
+# Registration form flow
+# ---------------------------------------------------------------------------
+async def _try_click(page: Page, selectors: list, label: str) -> bool:
+    """Attempt selectors in order; return True on first successful click."""
+    for sel in selectors:
         try:
-            locator = page.locator(sel).first
-            if await locator.count() == 0:
+            loc = page.locator(sel).first
+            if await loc.count() == 0:
                 continue
-            await locator.click(timeout=3000)
-            clicked_signup = True
-            logger.info("Clicked signup trigger using selector: %s", sel)
-            break
+            if not await loc.is_visible():
+                continue
+            await loc.click(timeout=3000)
+            logger.info("✓ %s — clicked via: %s", label, sel)
+            return True
         except Exception:
             continue
+    logger.warning("✗ %s — no selector matched", label)
+    return False
 
-    if not clicked_signup:
-        logger.warning(
-            "Could not find 'Create account' button — proceeding anyway; "
-            "the registration form may already be visible."
-        )
 
-    # Wait for the registration fields to appear.
-    await page.wait_for_timeout(2000)
-
-    # -- Step 2: fill dummy email ---------------------------------------------
-    email_selectors = [
-        "input[type='email']",
-        "input[name='email']",
-        "input[placeholder*='email' i]",
-        "input[placeholder*='mail' i]",
-        "input[id*='email' i]",
-    ]
-    filled_email = False
-    for sel in email_selectors:
+async def _try_fill(page: Page, selectors: list, value: str, label: str) -> bool:
+    """Attempt selectors in order; return True on first successful fill."""
+    for sel in selectors:
         try:
-            locator = page.locator(sel).first
-            if await locator.count() == 0:
+            loc = page.locator(sel).first
+            if await loc.count() == 0:
                 continue
-            await locator.fill("testuser_debug@example.com", timeout=3000)
-            filled_email = True
-            logger.info("Filled email field using selector: %s", sel)
-            break
+            await loc.fill(value, timeout=3000)
+            logger.info("✓ %s — filled via: %s", label, sel)
+            return True
         except Exception:
             continue
+    logger.warning("✗ %s — no selector matched", label)
+    return False
 
-    if not filled_email:
-        logger.warning("Could not find email input field.")
 
-    # -- Step 3: fill dummy password ------------------------------------------
-    password_selectors = [
-        "input[type='password']",
-        "input[name='password']",
-        "input[placeholder*='password' i]",
-        "input[id*='password' i]",
-    ]
-    filled_password = False
-    for sel in password_selectors:
-        try:
-            locator = page.locator(sel).first
-            if await locator.count() == 0:
-                continue
-            await locator.fill("DebugPass123!", timeout=3000)
-            filled_password = True
-            logger.info("Filled password field using selector: %s", sel)
-            break
-        except Exception:
-            continue
-
-    if not filled_password:
-        logger.warning("Could not find password input field.")
-
-    # -- Debug screenshot after filling the form ------------------------------
-    # Saved as debug_form.png so we can verify the fields were actually filled
-    # before we attempt to click Next.
-    await page.screenshot(path="debug_form.png", full_page=True)
-    logger.info("Saved post-fill screenshot to debug_form.png")
-
-    # -- Step 4a: log every visible button on the page so we know exact text --
-    # This is the most reliable way to discover the real label Xiaomi uses for
-    # the submit / next button (it can vary by locale and page variant).
-    logger.info("=== ALL BUTTONS on page (text / type / class) ===")
+async def _dump_buttons(page: Page) -> None:
+    """Log every button/submit element so we can identify exact selectors."""
+    logger.info("=== BUTTON DUMP ===")
     try:
-        btn_handles = await page.query_selector_all("button, input[type='submit'], input[type='button'], a[role='button']")
-        if not btn_handles:
-            logger.info("  (no button elements found)")
-        for idx, btn in enumerate(btn_handles):
+        handles = await page.query_selector_all(
+            "button, input[type='submit'], input[type='button'], a[role='button']"
+        )
+        if not handles:
+            logger.info("  (none found)")
+        for i, h in enumerate(handles):
             try:
-                txt   = (await btn.inner_text()).strip().replace("\n", " ")
-                btype = await btn.get_attribute("type") or ""
-                bcls  = await btn.get_attribute("class") or ""
-                bval  = await btn.get_attribute("value") or ""
-                visible = await btn.is_visible()
-                logger.info(
-                    "  [%d] visible=%-5s type=%-8s text=%r  value=%r  class=%s",
-                    idx, visible, btype, txt[:80], bval[:40], bcls[:80],
-                )
-            except Exception as e:
-                logger.warning("  [%d] could not inspect button: %s", idx, e)
+                txt  = (await h.inner_text()).strip().replace("\n", " ")[:80]
+                typ  = await h.get_attribute("type") or ""
+                cls  = (await h.get_attribute("class") or "")[:80]
+                vis  = await h.is_visible()
+                logger.info("  [%d] vis=%-5s type=%-8s text=%r  class=%s",
+                            i, vis, typ, txt, cls)
+            except Exception:
+                pass
     except Exception as e:
-        logger.error("Failed to enumerate buttons: %s", e)
+        logger.error("Button dump failed: %s", e)
     logger.info("=== END BUTTON DUMP ===")
 
-    # -- Step 4b: click "Next" / "Continue" to trigger reCAPTCHA --------------
-    next_selectors = [
-        # Text-based (most reliable when text is known)
+
+async def _trigger_registration_form(page: Page) -> None:
+    """
+    Full registration sequence that forces the captcha to appear:
+
+      Step 1 — Click the "Sign up" tab (switches from login to registration).
+      Step 2 — Fill Email address field.
+      Step 3 — Fill "Enter your new password" field.
+      Step 4 — Fill "Confirm new password" field.
+      Step 5 — Tick the "I've read and agreed..." checkbox.
+               (Without this the Next button stays disabled and the captcha
+                never appears.)
+      Step 6 — Click the orange "Next" button.
+    """
+    WAIT = 2000   # ms between every step
+
+    # ── Step 1 ── Sign up tab ────────────────────────────────────────────────
+    await _try_click(page, [
+        # Text-based (most reliable)
+        "text=Sign up",
+        "text=Create account",
+        "text=Register",
+        "text=注册",
+        # Tab/link variants Xiaomi uses
+        ".tab-item:has-text('Sign up')",
+        ".tab-item:has-text('Register')",
+        "[role='tab']:has-text('Sign up')",
+        "[role='tab']:has-text('Register')",
+        "a:has-text('Sign up')",
+        "a:has-text('Register')",
+        "a[href*='register']",
+        "button:has-text('Sign up')",
+        # Data attributes
+        "[data-testid='signup-tab']",
+        "[data-testid='register-tab']",
+    ], "Sign up tab")
+    await page.wait_for_timeout(WAIT)
+
+    # ── Step 2 ── Email ──────────────────────────────────────────────────────
+    await _try_fill(page, [
+        "input[type='email']",
+        "input[name='email']",
+        "input[name='account']",
+        "input[placeholder*='email' i]",
+        "input[placeholder*='Email' i]",
+        "input[placeholder*='mail' i]",
+        "input[id*='email' i]",
+        # Fallback: first visible text input that isn't a password field
+        "input[type='text']:visible",
+    ], "testuser_debug@example.com", "Email field")
+    await page.wait_for_timeout(WAIT)
+
+    # ── Step 3 ── New password ───────────────────────────────────────────────
+    # On multi-password forms the FIRST password field is "Enter your new password"
+    await _try_fill(page, [
+        "input[name='password']",
+        "input[name='newPassword']",
+        "input[name='new_password']",
+        "input[placeholder*='new password' i]",
+        "input[placeholder*='Enter your new password' i]",
+        "input[placeholder*='password' i]",
+        "input[id*='password' i]",
+        # If there are two fields, nth(0) is always the first
+        "(//input[@type='password'])[1]",
+        "input[type='password']",
+    ], "DebugPass123!", "New password field")
+    await page.wait_for_timeout(WAIT)
+
+    # ── Step 4 ── Confirm password ───────────────────────────────────────────
+    # The SECOND password field is "Confirm new password"
+    await _try_fill(page, [
+        "input[name='confirmPassword']",
+        "input[name='confirm_password']",
+        "input[name='passwordConfirm']",
+        "input[placeholder*='confirm' i]",
+        "input[placeholder*='Confirm new password' i]",
+        # nth() picks the second password input when there are two
+        "input[type='password'] >> nth=1",
+        "(//input[@type='password'])[2]",
+    ], "DebugPass123!", "Confirm password field")
+    await page.wait_for_timeout(WAIT)
+
+    # ── Debug screenshot after filling ──────────────────────────────────────
+    await page.screenshot(path=DEBUG_FORM_PATH, full_page=True)
+    logger.info("Saved post-fill screenshot → %s", DEBUG_FORM_PATH)
+
+    # ── Step 5 ── Agreement checkbox ─────────────────────────────────────────
+    # This is the small checkbox next to
+    # "I've read and agreed to the Xiaomi Account User Agreement..."
+    # Without ticking it, the Next button remains disabled.
+    await _try_click(page, [
+        # Checkbox by type
+        "input[type='checkbox']",
+        # Common class patterns for this checkbox on Xiaomi's page
+        ".agreement-checkbox input",
+        ".agree-checkbox input",
+        ".policy-checkbox input",
+        ".checkbox input",
+        "label.agreement input",
+        "label.agree input",
+        # Text proximity selectors
+        "label:has-text('agree') input",
+        "label:has-text('Agreement') input",
+        "label:has-text('User Agreement') input",
+        "[class*='agree'] input[type='checkbox']",
+        "[class*='policy'] input[type='checkbox']",
+        # Fallback: any visible checkbox
+        "input[type='checkbox']:visible",
+    ], "Agreement checkbox")
+    await page.wait_for_timeout(WAIT)
+
+    # ── Button dump (debug) ──────────────────────────────────────────────────
+    await _dump_buttons(page)
+
+    # ── Step 6 ── Next / Submit button ───────────────────────────────────────
+    await _try_click(page, [
+        # Exact text matches
         "button:has-text('Next')",
         "button:has-text('Continue')",
         "button:has-text('Sign up')",
         "button:has-text('Register')",
         "button:has-text('Create')",
-        "button:has-text('下一步')",        # Chinese "Next step"
-        "button:has-text('注册')",           # Chinese "Register"
-        "button:has-text('确定')",           # Chinese "Confirm"
+        "button:has-text('下一步')",
+        "button:has-text('注册')",
+        "button:has-text('确定')",
         "text=Next",
         "text=Continue",
-        # Type / role based
+        # Type-based
         "button[type='submit']",
         "input[type='submit']",
-        # Xiaomi / NutUI class patterns observed in the wild
+        # Xiaomi / NutUI CSS patterns
         ".n-footer .n-btn",
         ".n-footer button",
         ".submit-btn",
+        ".btn-submit",
         ".btn-primary",
         ".next-btn",
+        # Wildcard class attributes
         "[class*='submit']",
         "[class*='next']",
         "[class*='primary']",
-        # ARIA / data attributes
+        # ARIA / data
         "[aria-label*='next' i]",
         "[aria-label*='submit' i]",
-        "[aria-label*='continue' i]",
         "[data-testid*='next' i]",
         "[data-testid*='submit' i]",
-        # Last-resort: any button that is visible and enabled
+        # Absolute last resort: first visible button
         "button:visible",
-    ]
-    clicked_next = False
-    for sel in next_selectors:
-        try:
-            locator = page.locator(sel).first
-            if await locator.count() == 0:
-                continue
-            if not await locator.is_visible():
-                continue
-            await locator.click(timeout=3000)
-            clicked_next = True
-            logger.info("Clicked next/submit using selector: %s", sel)
-            break
-        except Exception:
-            continue
-
-    if not clicked_next:
-        logger.warning(
-            "Could not find Next/Submit button — reCAPTCHA may not appear. "
-            "Check the button dump above and update next_selectors."
-        )
-
-    return clicked_signup or filled_email or clicked_next
+    ], "Next / Submit button")
 
 
-async def run(headless: bool = False) -> None:
-    async with async_playwright() as playwright:
-        browser, context = await launch_stealth_context(playwright, headless=headless)
+# ---------------------------------------------------------------------------
+# Main run loop
+# ---------------------------------------------------------------------------
+async def run(headless: bool = True) -> None:
+    async with async_playwright() as pw:
+        browser, context = await launch_stealth_context(pw, headless=headless)
         page: Optional[Page] = None
         try:
             page = await context.new_page()
 
-            logger.info("Navigating to Xiaomi login page...")
+            logger.info("Opening Xiaomi login page…")
             await page.goto(XIAOMI_LOGIN_URL, wait_until="domcontentloaded")
-
-            # Give the SPA a moment to hydrate form fields / anti-bot scripts.
             await page.wait_for_load_state("networkidle")
             logger.info("Landed on: %s", page.url)
 
-            # Walk through the registration form to force the reCAPTCHA to
-            # render. Without filling & submitting the form, the captcha iframe
-            # never appears in the DOM.
-            logger.info("Triggering registration form to force reCAPTCHA...")
+            # Walk through the form to trigger the captcha.
+            logger.info("Starting registration flow…")
             await _trigger_registration_form(page)
 
-            # Now wait 10 s for the reCAPTCHA tile images to finish loading.
-            # This wait is placed *after* the form submission so we're giving
-            # time to the challenge that was just triggered, not the blank page.
-            logger.info("Waiting 10s for reCAPTCHA tiles to finish loading...")
+            # ── Wait 10 s AFTER clicking Next so the captcha has time to load ──
+            logger.info("Waiting 10 s for captcha to render…")
             await page.wait_for_timeout(10000)
 
-            # Scroll to bottom so any lazy-rendered widget comes into view.
-            logger.info("Scrolling to bottom of page...")
+            # Scroll to bottom in case the widget is below the fold.
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await page.wait_for_timeout(2000)
 
-            # ---- DEBUG: dump all <iframe> tags from page.content() ----------
-            # This tells us exactly which captcha provider Xiaomi is using and
-            # what CSS selectors / src patterns are available.
-            html_content = await page.content()
-            iframe_tags = re.findall(r"<iframe[^>]*>", html_content, re.IGNORECASE)
-            logger.info("=== RAW HTML iframe tags found: %d ===", len(iframe_tags))
+            # ── Dump raw iframe tags from page source ──────────────────────
+            html         = await page.content()
+            iframe_tags  = re.findall(r"<iframe[^>]*>", html, re.IGNORECASE)
+            logger.info("=== RAW <iframe> TAGS FOUND: %d ===", len(iframe_tags))
             for i, tag in enumerate(iframe_tags):
                 logger.info("  [%d] %s", i, tag)
             if not iframe_tags:
-                logger.info("  (no <iframe> tags in page source)")
-            logger.info("=== END iframe dump ===")
+                logger.info("  (none)")
+            logger.info("=== END IFRAME DUMP ===")
 
-            # Full-page screenshot so we can see exactly what the browser sees
-            # after the registration step — captcha should be visible here.
+            # ── Full-page screenshot ───────────────────────────────────────
             await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
-            logger.info("Saved screenshot to %s", SCREENSHOT_PATH)
+            logger.info("Saved screenshot → %s", SCREENSHOT_PATH)
 
-            # Hand off to the YOLO captcha solver.
+            # ── YOLO solve ────────────────────────────────────────────────
             await solve_captcha(page)
 
-            # Keep the window open for manual inspection when running headed.
             if not headless:
                 logger.info("Press Ctrl+C to exit.")
                 await asyncio.Event().wait()
+
         finally:
-            if page is not None:
+            if page:
                 await page.close()
             await context.close()
             await browser.close()
 
 
 def main() -> None:
-    # headless=True so this also works in environments without a display
-    # server (e.g. GitHub Codespaces, CI). Flip to False locally if you want
-    # to watch the browser and keep the window open via the Ctrl+C loop.
     try:
         asyncio.run(run(headless=True))
     except KeyboardInterrupt:
-        logger.info("Interrupted by user.")
+        logger.info("Interrupted.")
 
 
 if __name__ == "__main__":
