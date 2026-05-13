@@ -12,6 +12,7 @@ target object in viewport coordinates.
 
 import asyncio
 import logging
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -59,7 +60,7 @@ RECAPTCHA_CHALLENGE_SELECTORS = (
 # is captured with full_page=True, this crop must lie within the initial
 # viewport (no scroll offset) for the click coordinates to line up correctly.
 # A typical reCAPTCHA v2 image challenge is roughly 400x580 px.
-CAPTCHA_CROP_BOX: Tuple[int, int, int, int] = (400, 180, 800, 760)
+CAPTCHA_CROP_BOX: Tuple[int, int, int, int] = (0, 0, 1000, 1000)
 
 # Where to write the cropped captcha for YOLO inference / debugging.
 CAPTCHA_CROP_PATH = "captcha_crop.png"
@@ -316,8 +317,24 @@ async def run(headless: bool = False) -> None:
             # Extra wait so the reCAPTCHA tile images (the 3x3 / 4x4 grid)
             # finish loading. networkidle alone is not enough because tiles
             # are lazily requested after the iframe renders.
-            logger.info("Waiting 5s for reCAPTCHA tiles to finish loading...")
-            await page.wait_for_timeout(5000)
+            logger.info("Waiting 10s for reCAPTCHA tiles to finish loading...")
+            await page.wait_for_timeout(10000)
+
+            # Scroll to the bottom of the page to trigger any lazy-loaded
+            # captcha widgets that only render when scrolled into view.
+            logger.info("Scrolling to bottom of page...")
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(2000)
+
+            # ---- DEBUG: dump all <iframe> tags from page.content() ----
+            html_content = await page.content()
+            iframe_tags = re.findall(r"<iframe[^>]*>", html_content, re.IGNORECASE)
+            logger.info("=== RAW HTML iframe tags found: %d ===", len(iframe_tags))
+            for i, tag in enumerate(iframe_tags):
+                logger.info("  [%d] %s", i, tag)
+            if not iframe_tags:
+                logger.info("  (no <iframe> tags in page source)")
+            logger.info("=== END iframe dump ===")
 
             # Capture a full-page screenshot after load but before the captcha
             # is triggered - handy for inspecting layout and confirming that
