@@ -62,6 +62,14 @@ CLICK_DELAY_S       = 0.4   # pause between object clicks (seconds)
 HUMAN_JITTER_PX     = 5     # ±px random offset on every click
 ROUND_WAIT_MS       = 3000  # ms to wait for the grid to load each round
 
+# Tile-drain inner loop
+TILE_DRAIN_WAIT_MS  = 2000  # ms to wait after each click before re-detecting
+MAX_TILE_CLICKS     = 3     # maximum click attempts per individual tile coordinate
+
+# Session persistence — saves cookies/localStorage so future runs are
+# already "recognised" by reCAPTCHA / Xiaomi, reducing captcha frequency.
+AUTH_JSON_PATH      = "auth.json"
+
 # Fallback full-page crop when bframe bounding box cannot be found
 CAPTCHA_CROP_FALLBACK: Tuple[int, int, int, int] = (0, 0, 1080, 1920)
 
@@ -316,43 +324,86 @@ async def solve_captcha_loop(page: Page) -> bool:
                 logger.warning("Giving up waiting for bframe")
                 break
 
-        # Step 2 ── wait for tiles to fully load ─────────────────────────────
+        # Step 3 ── wait for tiles to fully load, then enter the drain loop ──
         await page.wait_for_timeout(ROUND_WAIT_MS)
 
-        # Step 3 ── screenshot + crop ─────────────────────────────────────────
-        await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
-        logger.info("[round %d] Screenshot saved → %s", rnd, SCREENSHOT_PATH)
+        # (initial screenshot/crop is taken inside the tile-drain loop below)
 
-        raw_box  = await _bounding_box(page, BFRAME_SELS)
-        crop_box = _clamp_box(raw_box) if raw_box else _clamp_box(CAPTCHA_CROP_FALLBACK)
-        logger.info("[round %d] Crop box: %s", rnd, crop_box)
+        # Step 4 ── Tile-drain inner loop ────────────────────────────────────
+        # After every click a tile may fade out and be replaced by a new one.
+        # We keep re-detecting and clicking until YOLO returns zero targets,
+        # which means the grid is fully "drained" and we can move to Verify /
+        # Next.  A per-coordinate click counter caps attempts at MAX_TILE_CLICKS
+        # so a sticky tile that never fades cannot trap us in an infinite loop.
 
-        try:
-            _crop_screenshot(SCREENSHOT_PATH, crop_box, CAPTCHA_CROP_PATH)
-        except FileNotFoundError as exc:
-            logger.error(exc)
-            break
+        event_loop  = asyncio.get_running_loop()
+        click_counts: dict = {}   # key = (round_cx, round_cy), value = clicks so far
 
-        # Step 4 ── YOLO detection + human-like clicks ────────────────────────
-        loop       = asyncio.get_running_loop()
-        detections = await loop.run_in_executor(
-            None, _run_yolo, CAPTCHA_CROP_PATH, (crop_box[0], crop_box[1])
-        )
+        drain_pass = 0
+        while True:
+            drain_pass += 1
 
-        logger.info("[round %d] YOLO found %d target(s)", rnd, len(detections))
-        for label, conf, cx, cy in detections:
-            logger.info("  %-15s conf=%.2f  vp=(%.1f, %.1f)", label, conf, cx, cy)
+            # Fresh screenshot + crop for this drain pass
+            await page.screenshot(path=SCREENSHOT_PATH, full_page=True)
+            raw_box_d  = await _bounding_box(page, BFRAME_SELS)
+            crop_box_d = _clamp_box(raw_box_d) if raw_box_d else _clamp_box(CAPTCHA_CROP_FALLBACK)
+            try:
+                _crop_screenshot(SCREENSHOT_PATH, crop_box_d, CAPTCHA_CROP_PATH)
+            except FileNotFoundError as exc:
+                logger.error("Drain pass %d: %s", drain_pass, exc)
+                break
 
-        for label, _, cx, cy in detections:
-            # Apply human-like jitter and clamp to viewport
-            jx = max(0.0, min(_jitter(cx), float(VIEWPORT["width"]  - 1)))
-            jy = max(0.0, min(_jitter(cy), float(VIEWPORT["height"] - 1)))
-            logger.info("  Click '%s' at (%.1f, %.1f) [jittered from (%.1f, %.1f)]",
-                        label, jx, jy, cx, cy)
-            await page.mouse.click(jx, jy)
-            await asyncio.sleep(CLICK_DELAY_S)
+            detections = await event_loop.run_in_executor(
+                None, _run_yolo, CAPTCHA_CROP_PATH, (crop_box_d[0], crop_box_d[1])
+            )
 
-        # Short pause before checking the button
+            logger.info("[round %d / drain %d] YOLO found %d target(s)",
+                        rnd, drain_pass, len(detections))
+
+            if not detections:
+                logger.info("[round %d] Grid fully drained — proceeding to button", rnd)
+                break
+
+            clicked_any = False
+            for label, conf, cx, cy in detections:
+                # Round coords to a stable key (nearest 10 px grid)
+                key = (round(cx / 10) * 10, round(cy / 10) * 10)
+                attempts = click_counts.get(key, 0)
+
+                if attempts >= MAX_TILE_CLICKS:
+                    logger.warning(
+                        "  Skipping '%s' at (%.1f,%.1f) — already clicked %d/%d times",
+                        label, cx, cy, attempts, MAX_TILE_CLICKS,
+                    )
+                    continue
+
+                # Human-like jitter + viewport clamp
+                jx = max(0.0, min(_jitter(cx), float(VIEWPORT["width"]  - 1)))
+                jy = max(0.0, min(_jitter(cy), float(VIEWPORT["height"] - 1)))
+                logger.info(
+                    "  [drain %d] Click '%s' conf=%.2f at (%.1f,%.1f) "
+                    "[attempt %d/%d, jitter from (%.1f,%.1f)]",
+                    drain_pass, label, conf, jx, jy,
+                    attempts + 1, MAX_TILE_CLICKS, cx, cy,
+                )
+                await page.mouse.click(jx, jy)
+                click_counts[key] = attempts + 1
+                clicked_any = True
+                await asyncio.sleep(CLICK_DELAY_S)
+
+                # Wait for the tile fade/replace animation before re-detecting
+                await page.wait_for_timeout(TILE_DRAIN_WAIT_MS)
+
+            if not clicked_any:
+                # All remaining detections hit their click cap — exit drain loop
+                logger.warning(
+                    "[round %d] All remaining tiles hit MAX_TILE_CLICKS (%d) — "
+                    "exiting drain loop",
+                    rnd, MAX_TILE_CLICKS,
+                )
+                break
+
+        # Brief settle pause before reading the bframe button
         await page.wait_for_timeout(800)
 
         # Step 5 ── read bframe button and act ────────────────────────────────
@@ -397,6 +448,16 @@ async def solve_captcha_loop(page: Page) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def launch_stealth_context(playwright, headless: bool = True):
+    """Launch a stealth Chromium context.
+
+    Session persistence via AUTH_JSON_PATH (auth.json):
+      • If auth.json exists it is loaded as storage_state so cookies,
+        localStorage and sessionStorage are restored.  reCAPTCHA and Xiaomi
+        will treat the browser as a recognised session, reducing or skipping
+        the image challenge entirely.
+      • Call `await context.storage_state(path=AUTH_JSON_PATH)` at any point
+        to persist the current session (see run() below).
+    """
     browser = await playwright.chromium.launch(
         headless=headless,
         args=[
@@ -405,6 +466,15 @@ async def launch_stealth_context(playwright, headless: bool = True):
             "--disable-dev-shm-usage",
         ],
     )
+
+    # Load saved session if it exists
+    auth_path = Path(AUTH_JSON_PATH)
+    storage   = str(auth_path) if auth_path.exists() else None
+    if storage:
+        logger.info("Restoring session from %s", AUTH_JSON_PATH)
+    else:
+        logger.info("No saved session found — starting fresh (%s)", AUTH_JSON_PATH)
+
     context = await browser.new_context(
         user_agent=USER_AGENT,
         viewport=VIEWPORT,
@@ -412,6 +482,7 @@ async def launch_stealth_context(playwright, headless: bool = True):
         timezone_id=TIMEZONE_ID,
         is_mobile=True,
         has_touch=True,
+        storage_state=storage,   # None = fresh session; str path = restore
     )
     await Stealth().apply_stealth_async(context)
     return browser, context
@@ -585,6 +656,10 @@ async def run(headless: bool = True) -> None:
             solved = await solve_captcha_loop(page)
             if solved:
                 logger.info("Registration captcha passed — continuing flow.")
+                # ── Persist session so future runs benefit from a recognised
+                #    browser fingerprint / cookie jar (reduces captcha load).
+                await context.storage_state(path=AUTH_JSON_PATH)
+                logger.info("Session saved → %s", AUTH_JSON_PATH)
             else:
                 logger.error("Registration captcha could not be solved.")
 
