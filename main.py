@@ -42,13 +42,24 @@ SCREENSHOT_PATH = "check.png"
 
 # ---- Captcha / YOLO config --------------------------------------------------
 
-# Pixel region of `check.png` that contains the object-selection captcha.
-# Tune this once after inspecting check.png for the first time. The box is
-# (left, top, right, bottom) in the screenshot's coordinate space.
+# CSS selector used to locate the reCAPTCHA image-challenge iframe. Its
+# bounding box is preferred over the hardcoded CAPTCHA_CROP_BOX fallback
+# because reCAPTCHA renders the challenge at slightly different coords
+# depending on viewport / prompt length.
+RECAPTCHA_CHALLENGE_SELECTORS = (
+    'iframe[src*="recaptcha/api2/bframe"]',
+    'iframe[src*="recaptcha/enterprise/bframe"]',
+    'iframe[title*="recaptcha challenge"]',
+)
+
+# Fallback pixel region of `check.png` that contains the object-selection
+# captcha, used only if the iframe bounding box above cannot be resolved.
+# The box is (left, top, right, bottom) in the screenshot's coordinate space.
 # NOTE: page.mouse.click() uses viewport-relative coordinates. Since check.png
 # is captured with full_page=True, this crop must lie within the initial
 # viewport (no scroll offset) for the click coordinates to line up correctly.
-CAPTCHA_CROP_BOX: Tuple[int, int, int, int] = (400, 180, 1000, 620)
+# A typical reCAPTCHA v2 image challenge is roughly 400x580 px.
+CAPTCHA_CROP_BOX: Tuple[int, int, int, int] = (400, 180, 800, 760)
 
 # Where to write the cropped captcha for YOLO inference / debugging.
 CAPTCHA_CROP_PATH = "captcha_crop.png"
@@ -70,8 +81,10 @@ TARGET_CLASSES = {
     "stop sign",
 }
 
-# Minimum confidence for a detection to be clicked.
-YOLO_CONFIDENCE_THRESHOLD = 0.35
+# Minimum confidence for a detection to be clicked. Kept low (0.20) because
+# reCAPTCHA tiles are small crops of real objects and YOLO often returns
+# modest confidences on them.
+YOLO_CONFIDENCE_THRESHOLD = 0.20
 
 # Small delay between clicks so the interaction looks more human.
 CLICK_DELAY_SECONDS = 0.4
@@ -156,6 +169,46 @@ def _detect_targets(
     return detections
 
 
+async def _locate_recaptcha_box(
+    page: Page,
+) -> Optional[Tuple[int, int, int, int]]:
+    """Try to resolve the reCAPTCHA challenge iframe's bounding box and
+    return it as (left, top, right, bottom) in viewport coordinates.
+
+    Returns None if no matching iframe is visible - callers should fall
+    back to the hardcoded CAPTCHA_CROP_BOX in that case.
+    """
+    for selector in RECAPTCHA_CHALLENGE_SELECTORS:
+        locator = page.locator(selector)
+        try:
+            count = await locator.count()
+        except Exception:
+            continue
+        if count == 0:
+            continue
+        try:
+            box = await locator.first.bounding_box()
+        except Exception:
+            box = None
+        if not box:
+            continue
+        left = int(box["x"])
+        top = int(box["y"])
+        right = int(box["x"] + box["width"])
+        bottom = int(box["y"] + box["height"])
+        logger.info(
+            "Resolved reCAPTCHA challenge via %s -> (%d, %d, %d, %d)",
+            selector,
+            left,
+            top,
+            right,
+            bottom,
+        )
+        return (left, top, right, bottom)
+
+    return None
+
+
 async def solve_captcha(page: Page) -> bool:
     """Solve Xiaomi's object-selection captcha using YOLOv8.
 
@@ -167,9 +220,20 @@ async def solve_captcha(page: Page) -> bool:
 
     Returns True when at least one target was detected and clicked.
     """
+    # Prefer the live iframe bounding box over CAPTCHA_CROP_BOX - this way
+    # we stay aligned even if reCAPTCHA shifts the challenge around.
+    crop_box = await _locate_recaptcha_box(page)
+    if crop_box is None:
+        logger.warning(
+            "reCAPTCHA iframe not found; falling back to hardcoded "
+            "CAPTCHA_CROP_BOX=%s.",
+            CAPTCHA_CROP_BOX,
+        )
+        crop_box = CAPTCHA_CROP_BOX
+
     try:
         crop_path = _crop_captcha(
-            SCREENSHOT_PATH, CAPTCHA_CROP_BOX, CAPTCHA_CROP_PATH
+            SCREENSHOT_PATH, crop_box, CAPTCHA_CROP_PATH
         )
     except FileNotFoundError as exc:
         logger.error("%s", exc)
@@ -177,7 +241,7 @@ async def solve_captcha(page: Page) -> bool:
 
     # Inference is CPU/GPU bound and synchronous - run it off the event loop.
     loop = asyncio.get_running_loop()
-    crop_origin = (CAPTCHA_CROP_BOX[0], CAPTCHA_CROP_BOX[1])
+    crop_origin = (crop_box[0], crop_box[1])
     detections = await loop.run_in_executor(
         None, _detect_targets, crop_path, crop_origin
     )
@@ -248,6 +312,12 @@ async def run(headless: bool = False) -> None:
             # Give the SPA a moment to hydrate form fields / anti-bot scripts.
             await page.wait_for_load_state("networkidle")
             logger.info("Landed on: %s", page.url)
+
+            # Extra wait so the reCAPTCHA tile images (the 3x3 / 4x4 grid)
+            # finish loading. networkidle alone is not enough because tiles
+            # are lazily requested after the iframe renders.
+            logger.info("Waiting 5s for reCAPTCHA tiles to finish loading...")
+            await page.wait_for_timeout(5000)
 
             # Capture a full-page screenshot after load but before the captcha
             # is triggered - handy for inspecting layout and confirming that
