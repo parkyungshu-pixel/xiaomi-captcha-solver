@@ -1,1 +1,2 @@
-# Add your project dependencies here
+playwright>=1.44.0
+playwright-stealth>=2.0.0
